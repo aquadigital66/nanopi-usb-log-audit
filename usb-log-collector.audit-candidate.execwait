@@ -1912,7 +1912,29 @@ check_message_rotation() {
         return 1
     }
 
-    [ "$info" != "MISSING" ] || return 0
+    if [ "$info" = "MISSING" ]; then
+        # A running logread may still hold an unlinked inode. Stop only a
+        # process whose identity is verified, recreate the path, then restart.
+        if ! stop_reader; then
+            log_msg "MESSAGE_LOG_MISSING: reader could not be safely stopped"
+            return 1
+        fi
+
+        rotation_usb_guard force || return 1
+
+        if ! usb_fs_op "$USB_MOUNT" create "${MESSAGE_LOG##*/}"; then
+            log_msg "MESSAGE_LOG_MISSING: cannot recreate current log"
+            return 1
+        fi
+
+        if ! restart_reader_after_rotation; then
+            log_msg "MESSAGE_LOG_MISSING: reader restart failed"
+            return 1
+        fi
+
+        log_msg "MESSAGE_LOG_RECREATED"
+        return 0
+    fi
 
     [[ "$info" =~ ^[0-9]+$ ]] || {
         log_msg "MESSAGE_ROTATION_ERROR: invalid current log size"
@@ -2062,9 +2084,16 @@ check_message_rotation() {
 
 
 cleanup_old_ble() {
+    local cleanup_started
+
     [ "$PROCESS_BLOCKED" -eq 0 ] || return 1
     [ "$USB_READY" -eq 1 ] || return 1
     [ -d "$CAPDIR" ] && [ ! -L "$CAPDIR" ] || return 1
+
+    # Rate-limit failed attempts too; otherwise the 5-second main loop
+    # retries and logs the same cleanup failure continuously.
+    cleanup_started=$(date +%s) || return 1
+    LAST_CLEANUP="$cleanup_started"
 
     if ! check_usb_writable; then
         log_msg "BLE_CLEANUP_ABORT: USB validation/write check failed status=$USB_STATUS"
