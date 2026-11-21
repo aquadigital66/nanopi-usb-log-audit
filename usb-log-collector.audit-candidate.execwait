@@ -106,7 +106,7 @@ def mount_record(dfd):
     matches = []
     with open("/proc/self/mountinfo", "r") as stream:
         for line in stream:
-            left, right = line.rstrip("\\n").split(" - ", 1)
+            left, right = line.rstrip("\n").split(" - ", 1)
             fields = left.split()
             right_fields = right.split()
             if fields[0] == mnt_id:
@@ -419,7 +419,7 @@ def mount_record(dfd):
     matches = []
     with open("/proc/self/mountinfo", "r") as stream:
         for line in stream:
-            left, right = line.rstrip("\\n").split(" - ", 1)
+            left, right = line.rstrip("\n").split(" - ", 1)
             fields = left.split()
             right_fields = right.split()
             if fields[0] == mnt_id:
@@ -2289,7 +2289,7 @@ PY_USB_VALIDATE
 }
 
 validate_existing_mount() {
-    local source dev uuid opts rc
+    local source dev uuid opts rc info
 
     check_usb_mountpoint || return 1
 
@@ -2304,8 +2304,9 @@ import re
 import sys
 
 path = sys.argv[1]
+
 def unescape(value):
-    return re.sub(r'\\\\([0-7]{3})',
+    return re.sub(r'\\([0-7]{3})',
                   lambda m: chr(int(m.group(1), 8)), value)
 
 fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
@@ -2316,7 +2317,7 @@ try:
     found = []
     with open("/proc/self/mountinfo", "r") as stream:
         for line in stream:
-            left, right = line.rstrip("\\n").split(" - ", 1)
+            left, right = line.rstrip("\n").split(" - ", 1)
             fields = left.split()
             rhs = right.split()
             if fields[0] == mnt_id:
@@ -2324,7 +2325,7 @@ try:
                               fields[5], rhs[2]))
     if len(found) != 1 or found[0][0] != path:
         raise SystemExit("mount ID missing, ambiguous, or wrong mountpoint")
-    print(found[0][1] + "\\t" + found[0][2] + "," + found[0][3])
+    print(found[0][1] + "\t" + found[0][2] + "," + found[0][3])
 finally:
     os.close(fd)
 PY_MOUNT_INFO
@@ -2333,7 +2334,34 @@ PY_MOUNT_INFO
         return 1
     }
 
-    source="${info%%
+    IFS=$'\t' read -r source opts <<< "$info"
+    [ -n "$source" ] || {
+        USB_STATUS="MOUNT_SOURCE_MISSING"
+        return 1
+    }
+
+    dev=$(readlink -f "$source" 2>/dev/null) || {
+        USB_STATUS="MOUNT_SOURCE_RESOLVE_FAILED"
+        return 1
+    }
+
+    validate_usb_device "$dev"
+    rc=$?
+    [ "$rc" -eq 0 ] || return "$rc"
+
+    uuid="$VALIDATED_UUID"
+
+    if [ -n "$USB_SOURCE" ] && [ "$dev" != "$USB_SOURCE" ]; then
+        USB_STATUS="MOUNT_SOURCE_CHANGED"
+        return 1
+    fi
+
+    if [ -n "$USB_UUID" ] && [ "$uuid" != "$USB_UUID" ]; then
+        USB_STATUS="MOUNT_UUID_CHANGED"
+        return 1
+    fi
+
+    case ",$opts," in
         *,ro,*)
             USB_STATUS="MOUNT_READ_ONLY"
             return 1
