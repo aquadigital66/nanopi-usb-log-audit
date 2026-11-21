@@ -186,6 +186,48 @@ try:
         ):
             fail("invalid basename: " + repr(name))
 
+    def rename_noreplace(src, dst):
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        fn = getattr(libc, "renameat2", None)
+        if fn is None:
+            raise OSError("renameat2 is unavailable")
+        fn.argtypes = [
+            ctypes.c_int, ctypes.c_char_p,
+            ctypes.c_int, ctypes.c_char_p,
+            ctypes.c_uint
+        ]
+        fn.restype = ctypes.c_int
+        rc = fn(dfd, os.fsencode(src), dfd, os.fsencode(dst), 1)
+        if rc != 0:
+            err = ctypes.get_errno()
+            raise OSError(err, os.strerror(err), src, dst)
+
+    def quarantine_file(name):
+        original = regular_file(name)
+        quarantine = ".usb-log-collector-quarantine-" + os.urandom(12).hex()
+        rename_noreplace(name, quarantine)
+        moved = regular_file(quarantine)
+        if (moved.st_dev, moved.st_ino) != (original.st_dev, original.st_ino):
+            try:
+                rename_noreplace(quarantine, name)
+            except OSError as exc:
+                fail("file identity changed; quarantined file retained as " +
+                     quarantine + ": " + str(exc))
+            fail("file identity changed during quarantine; original name restored")
+        return quarantine, original
+
+    def safe_unlink(name):
+        quarantine, original = quarantine_file(name)
+        moved = regular_file(quarantine)
+        if (moved.st_dev, moved.st_ino) != (original.st_dev, original.st_ino):
+            try:
+                rename_noreplace(quarantine, name)
+            except OSError:
+                fail("quarantined file changed; retained as " + quarantine)
+            fail("quarantined inode changed; original name restored")
+        os.unlink(quarantine)
+
     # Validate every caller-supplied filesystem name before dispatch.
     if action in (
         "append-event", "create", "exec-logread", "exec-btmon",
@@ -283,42 +325,25 @@ try:
 
     elif action == "unlink":
         name = args[0]
-        st = regular_file(name, missing_ok=True)
-        if st is not None:
-            os.unlink(name, dir_fd=dfd)
+        if regular_file(name, missing_ok=True) is not None:
+            safe_unlink(name)
 
     elif action == "rename":
         src, dst = args
-        regular_file(src)
-        dst_st = regular_file(dst, missing_ok=True)
-        if dst_st is not None:
-            fail("rename destination already exists: " + dst)
-        # Atomic rename that refuses to replace an existing destination.
-        # No unsafe fallback if renameat2 is unavailable.
-        import ctypes
-        import errno
+        quarantine, original = quarantine_file(src)
+        try:
+            rename_noreplace(quarantine, dst)
+        except OSError as exc:
+            try:
+                rename_noreplace(quarantine, src)
+            except OSError as restore_exc:
+                fail("rename failed and source could not be restored; file retained as " +
+                     quarantine + ": " + str(restore_exc))
+            fail("renameat2(RENAME_NOREPLACE) failed: " + str(exc))
 
-        libc = ctypes.CDLL(None, use_errno=True)
-        renameat2 = getattr(libc, "renameat2", None)
-        if renameat2 is None:
-            fail("renameat2 is unavailable; refusing non-atomic rename")
-
-        renameat2.argtypes = [
-            ctypes.c_int, ctypes.c_char_p,
-            ctypes.c_int, ctypes.c_char_p,
-            ctypes.c_uint
-        ]
-        renameat2.restype = ctypes.c_int
-
-        rc = renameat2(
-            dfd, os.fsencode(src),
-            dfd, os.fsencode(dst),
-            1  # RENAME_NOREPLACE
-        )
-        if rc != 0:
-            err = ctypes.get_errno()
-            fail("renameat2(RENAME_NOREPLACE) failed: " +
-                 os.strerror(err))
+        moved = regular_file(dst)
+        if (moved.st_dev, moved.st_ino) != (original.st_dev, original.st_ino):
+            fail("renamed destination inode differs from verified source")
 
     elif action == "ble-used":
         total = 0
@@ -343,7 +368,7 @@ try:
                 continue
             st = regular_file(name)
             if st.st_mtime < cutoff:
-                os.unlink(name, dir_fd=dfd)
+                safe_unlink(name)
 
     elif action == "mkdir":
         name = args[0]
@@ -495,6 +520,48 @@ try:
         ):
             fail("invalid basename: " + repr(name))
 
+    def rename_noreplace(src, dst):
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        fn = getattr(libc, "renameat2", None)
+        if fn is None:
+            raise OSError("renameat2 is unavailable")
+        fn.argtypes = [
+            ctypes.c_int, ctypes.c_char_p,
+            ctypes.c_int, ctypes.c_char_p,
+            ctypes.c_uint
+        ]
+        fn.restype = ctypes.c_int
+        rc = fn(dfd, os.fsencode(src), dfd, os.fsencode(dst), 1)
+        if rc != 0:
+            err = ctypes.get_errno()
+            raise OSError(err, os.strerror(err), src, dst)
+
+    def quarantine_file(name):
+        original = regular_file(name)
+        quarantine = ".usb-log-collector-quarantine-" + os.urandom(12).hex()
+        rename_noreplace(name, quarantine)
+        moved = regular_file(quarantine)
+        if (moved.st_dev, moved.st_ino) != (original.st_dev, original.st_ino):
+            try:
+                rename_noreplace(quarantine, name)
+            except OSError as exc:
+                fail("file identity changed; quarantined file retained as " +
+                     quarantine + ": " + str(exc))
+            fail("file identity changed during quarantine; original name restored")
+        return quarantine, original
+
+    def safe_unlink(name):
+        quarantine, original = quarantine_file(name)
+        moved = regular_file(quarantine)
+        if (moved.st_dev, moved.st_ino) != (original.st_dev, original.st_ino):
+            try:
+                rename_noreplace(quarantine, name)
+            except OSError:
+                fail("quarantined file changed; retained as " + quarantine)
+            fail("quarantined inode changed; original name restored")
+        os.unlink(quarantine)
+
     # Validate every caller-supplied filesystem name before dispatch.
     if action in (
         "append-event", "create", "exec-logread", "exec-btmon",
@@ -592,42 +659,25 @@ try:
 
     elif action == "unlink":
         name = args[0]
-        st = regular_file(name, missing_ok=True)
-        if st is not None:
-            os.unlink(name, dir_fd=dfd)
+        if regular_file(name, missing_ok=True) is not None:
+            safe_unlink(name)
 
     elif action == "rename":
         src, dst = args
-        regular_file(src)
-        dst_st = regular_file(dst, missing_ok=True)
-        if dst_st is not None:
-            fail("rename destination already exists: " + dst)
-        # Atomic rename that refuses to replace an existing destination.
-        # No unsafe fallback if renameat2 is unavailable.
-        import ctypes
-        import errno
+        quarantine, original = quarantine_file(src)
+        try:
+            rename_noreplace(quarantine, dst)
+        except OSError as exc:
+            try:
+                rename_noreplace(quarantine, src)
+            except OSError as restore_exc:
+                fail("rename failed and source could not be restored; file retained as " +
+                     quarantine + ": " + str(restore_exc))
+            fail("renameat2(RENAME_NOREPLACE) failed: " + str(exc))
 
-        libc = ctypes.CDLL(None, use_errno=True)
-        renameat2 = getattr(libc, "renameat2", None)
-        if renameat2 is None:
-            fail("renameat2 is unavailable; refusing non-atomic rename")
-
-        renameat2.argtypes = [
-            ctypes.c_int, ctypes.c_char_p,
-            ctypes.c_int, ctypes.c_char_p,
-            ctypes.c_uint
-        ]
-        renameat2.restype = ctypes.c_int
-
-        rc = renameat2(
-            dfd, os.fsencode(src),
-            dfd, os.fsencode(dst),
-            1  # RENAME_NOREPLACE
-        )
-        if rc != 0:
-            err = ctypes.get_errno()
-            fail("renameat2(RENAME_NOREPLACE) failed: " +
-                 os.strerror(err))
+        moved = regular_file(dst)
+        if (moved.st_dev, moved.st_ino) != (original.st_dev, original.st_ino):
+            fail("renamed destination inode differs from verified source")
 
     elif action == "ble-used":
         total = 0
@@ -652,7 +702,7 @@ try:
                 continue
             st = regular_file(name)
             if st.st_mtime < cutoff:
-                os.unlink(name, dir_fd=dfd)
+                safe_unlink(name)
 
     elif action == "mkdir":
         name = args[0]
