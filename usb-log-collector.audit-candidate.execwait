@@ -106,14 +106,26 @@ def mount_record(dfd):
     matches = []
     with open("/proc/self/mountinfo", "r") as stream:
         for line in stream:
-            left, right = line.rstrip("\n").split(" - ", 1)
-            fields = left.split()
-            right_fields = right.split()
+            try:
+                left, right = line.rstrip("\n").split(" - ", 1)
+                fields = left.split()
+                right_fields = right.split()
+            except ValueError:
+                fail("malformed mountinfo record")
+
+            if len(fields) < 7 or len(right_fields) < 3:
+                fail("incomplete mountinfo record")
+
             if fields[0] == mnt_id:
                 matches.append((
-                    fields[0], fields[2], unescape_mount(fields[4]),
-                    right_fields[0], unescape_mount(right_fields[1]),
-                    fields[5], right_fields[2],
+                    fields[0],
+                    fields[2],
+                    unescape_mount(fields[4]),
+                    right_fields[0],
+                    unescape_mount(right_fields[1]),
+                    fields[5],
+                    right_fields[2],
+                    unescape_mount(fields[3]),
                 ))
 
     if len(matches) != 1:
@@ -121,6 +133,8 @@ def mount_record(dfd):
     record = matches[0]
     if record[2] != mountpoint:
         fail("opened directory is not backed by the configured USB mountpoint")
+    if record[7] != "/":
+        fail("USB mount is not the root of the filesystem")
     return record
 
 def fail(message):
@@ -440,14 +454,26 @@ def mount_record(dfd):
     matches = []
     with open("/proc/self/mountinfo", "r") as stream:
         for line in stream:
-            left, right = line.rstrip("\n").split(" - ", 1)
-            fields = left.split()
-            right_fields = right.split()
+            try:
+                left, right = line.rstrip("\n").split(" - ", 1)
+                fields = left.split()
+                right_fields = right.split()
+            except ValueError:
+                fail("malformed mountinfo record")
+
+            if len(fields) < 7 or len(right_fields) < 3:
+                fail("incomplete mountinfo record")
+
             if fields[0] == mnt_id:
                 matches.append((
-                    fields[0], fields[2], unescape_mount(fields[4]),
-                    right_fields[0], unescape_mount(right_fields[1]),
-                    fields[5], right_fields[2],
+                    fields[0],
+                    fields[2],
+                    unescape_mount(fields[4]),
+                    right_fields[0],
+                    unescape_mount(right_fields[1]),
+                    fields[5],
+                    right_fields[2],
+                    unescape_mount(fields[3]),
                 ))
 
     if len(matches) != 1:
@@ -455,6 +481,8 @@ def mount_record(dfd):
     record = matches[0]
     if record[2] != mountpoint:
         fail("opened directory is not backed by the configured USB mountpoint")
+    if record[7] != "/":
+        fail("USB mount is not the root of the filesystem")
     return record
 
 def fail(message):
@@ -2214,13 +2242,24 @@ def unescape(value):
 def record():
     with open("/proc/self/mountinfo", "r") as stream:
         for line in stream:
-            left, right = line.rstrip("\n").split(" - ", 1)
-            fields = left.split()
-            rhs = right.split()
+            try:
+                left, right = line.rstrip("\n").split(" - ", 1)
+                fields = left.split()
+                rhs = right.split()
+            except ValueError:
+                raise RuntimeError("malformed mountinfo record")
+
+            if len(fields) < 7 or len(rhs) < 3:
+                raise RuntimeError("incomplete mountinfo record")
+
             if unescape(fields[4]) == mountpoint:
                 return (
-                    fields[0], fields[2], unescape(fields[4]),
-                    rhs[0], unescape(rhs[1])
+                    fields[0],
+                    fields[2],
+                    unescape(fields[4]),
+                    rhs[0],
+                    unescape(rhs[1]),
+                    unescape(fields[3])
                 )
     return None
 
@@ -2228,6 +2267,9 @@ try:
     before = record()
     if before is None:
         raise RuntimeError("mountpoint missing from mountinfo")
+
+    if before[5] != "/":
+        raise RuntimeError("mount is not the root of the filesystem")
 
     block = os.stat(source)
     if not stat.S_ISBLK(block.st_mode):
@@ -2358,14 +2400,30 @@ try:
     found = []
     with open("/proc/self/mountinfo", "r") as stream:
         for line in stream:
-            left, right = line.rstrip("\n").split(" - ", 1)
-            fields = left.split()
-            rhs = right.split()
+            try:
+                left, right = line.rstrip("\n").split(" - ", 1)
+                fields = left.split()
+                rhs = right.split()
+            except ValueError:
+                raise SystemExit("malformed mountinfo record")
+
+            if len(fields) < 7 or len(rhs) < 3:
+                raise SystemExit("incomplete mountinfo record")
+
             if fields[0] == mnt_id:
-                found.append((unescape(fields[4]), unescape(rhs[1]),
-                              fields[5], rhs[2]))
+                found.append((
+                    unescape(fields[4]),
+                    unescape(rhs[1]),
+                    fields[5],
+                    rhs[2],
+                    unescape(fields[3])
+                ))
+
     if len(found) != 1 or found[0][0] != path:
         raise SystemExit("mount ID missing, ambiguous, or wrong mountpoint")
+
+    if found[0][4] != "/":
+        raise SystemExit("mount is not the root of the filesystem")
     print(found[0][1] + "\t" + found[0][2] + "," + found[0][3])
 finally:
     os.close(fd)
