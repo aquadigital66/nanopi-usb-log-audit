@@ -1,7 +1,3 @@
-
-
-
-
 #!/bin/bash
 # NanoPi Venus OS — USB log collector
 # Managed by daemontools. Persistent script: /data/usb-log/usb-log-collector
@@ -2693,13 +2689,22 @@ handle_stop() {
 
     STOPPING=1
 
-    stop_btmon || rc=1
-    stop_reader || rc=1
+    # During startup refusal, an untracked reader/btmon may belong to
+    # another service. Never treat it as a child of this collector and
+    # never let its presence prevent release of our own main lock.
+    # Only stop children whose PID was recorded by this instance.
+    if [ -n "$BTMON_PID" ]; then
+        stop_btmon || rc=1
+    fi
+
+    if [ -n "$READER_PID" ]; then
+        stop_reader || rc=1
+    fi
 
     if [ "$rc" -eq 0 ]; then
         log_msg "COLLECTOR_STOPPED"
     else
-        log_msg "COLLECTOR_STOP_INCOMPLETE: child remains or state ambiguous"
+        log_msg "COLLECTOR_STOP_INCOMPLETE: owned child remains or state ambiguous"
     fi
 
     return "$rc"
