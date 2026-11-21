@@ -2205,30 +2205,33 @@ import sys
 mountpoint, source = sys.argv[1:3]
 
 def unescape(value):
-    return re.sub(
-        r'\\([0-7]{3})',
-        lambda m: chr(int(m.group(1), 8)),
-        value
-    )
+    return re.sub(r'\\([0-7]{3})',
+                  lambda m: chr(int(m.group(1), 8)), value)
 
-def record():
+def record_for_fd(fd):
+    with open("/proc/self/fdinfo/%d" % fd, "r") as stream:
+        mnt_id = next(line.split(":", 1)[1].strip()
+                      for line in stream if line.startswith("mnt_id:"))
+
+    matches = []
     with open("/proc/self/mountinfo", "r") as stream:
         for line in stream:
             left, right = line.rstrip("\n").split(" - ", 1)
             fields = left.split()
             rhs = right.split()
-            if unescape(fields[4]) == mountpoint:
-                return (
+            if fields[0] == mnt_id:
+                matches.append((
                     fields[0], fields[2], unescape(fields[4]),
                     rhs[0], unescape(rhs[1])
-                )
-    return None
+                ))
+
+    if len(matches) != 1:
+        raise RuntimeError("opened directory mount ID is absent or ambiguous")
+    if matches[0][2] != mountpoint:
+        raise RuntimeError("opened directory is not on configured mountpoint")
+    return matches[0]
 
 try:
-    before = record()
-    if before is None:
-        raise RuntimeError("mountpoint missing from mountinfo")
-
     block = os.stat(source)
     if not stat.S_ISBLK(block.st_mode):
         raise RuntimeError("source is not a block device")
@@ -2237,8 +2240,6 @@ try:
         str(os.major(block.st_rdev)) + ":" +
         str(os.minor(block.st_rdev))
     )
-    if before[1] != source_mm:
-        raise RuntimeError("mount device differs from source device")
 
     fd = os.open(
         mountpoint,
@@ -2256,7 +2257,11 @@ try:
         if opened_mm != source_mm:
             raise RuntimeError("opened directory is not on source device")
 
-        if record() != before:
+        before = record_for_fd(fd)
+        if before[1] != source_mm:
+            raise RuntimeError("mount device differs from source device")
+
+        if record_for_fd(fd) != before:
             raise RuntimeError("mount changed during validation")
 
         print(opened.st_dev)
