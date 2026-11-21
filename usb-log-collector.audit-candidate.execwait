@@ -1,0 +1,2638 @@
+
+
+
+
+#!/bin/bash
+# NanoPi Venus OS — USB log collector
+# Managed by daemontools. Persistent script: /data/usb-log/usb-log-collector
+
+set -o nounset
+set -o pipefail
+umask 077
+
+USB_LABEL="NANOPI_LOG"
+USB_MOUNT="/mnt/nanopi-log"
+CAPDIR="$USB_MOUNT/BLE-CAPTURE"
+MESSAGE_LOG="$USB_MOUNT/messages-live.log"
+
+LOCKDIR="/run/usb-log-collector.lock"
+REAPDIR="/run/usb-log-collector.reap"
+
+SEGMENT_KB=46080
+BLE_BUDGET_KB=3145728
+MIN_FREE_KB=102400
+MESSAGE_ROTATE_KB=51200
+BLE_RETENTION_MIN=10080
+LOOP_SECONDS=5
+CLEANUP_INTERVAL=300
+USB_WRITE_CHECK_INTERVAL=60
+
+USB_READY=0
+USB_FS_DEV=""
+PROCESS_BLOCKED=0
+USB_SOURCE=""
+USB_UUID=""
+USB_STATUS="INIT"
+VALIDATED_UUID=""
+DISCOVERED_SOURCE=""
+DISCOVERED_UUID=""
+LAST_LOGGED_STATUS=""
+TRANSIENT_ERRORS=0
+
+READER_PID=""
+READER_START=""
+LAST_READER_START=0
+
+BTMON_PID=""
+BTMON_START=""
+BTMON_FILE=""
+LAST_BT_START=0
+
+LAST_CLEANUP=0
+LAST_USB_WRITE_CHECK=0
+STOPPING=0
+LOCK_HELD=0
+REAP_HELD=0
+LOCK_RECOVERY_BLOCKED=0
+SHUTDOWN_DONE=0
+
+# USB filesystem operations.
+# Every operation opens the target directory without following its final
+# symlink and verifies st_dev against the currently validated USB filesystem.
+usb_fs_op() {
+    local directory
+    directory="$1"
+    shift
+
+    [ -n "$USB_FS_DEV" ] || return 1
+    [ -n "$USB_SOURCE" ] || return 1
+
+    python3 - "$directory" "$USB_FS_DEV" "$USB_SOURCE" "$USB_MOUNT" "$@" <<'PY_USB_FS'
+import os
+import sys
+import stat
+import time
+
+directory = sys.argv[1]
+expected_dev = int(sys.argv[2])
+source = sys.argv[3]
+mountpoint = sys.argv[4]
+action = sys.argv[5]
+args = sys.argv[6:]
+
+O_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+def unescape_mount(value):
+    import re
+    return re.sub(
+        r'\\([0-7]{3})',
+        lambda m: chr(int(m.group(1), 8)),
+        value
+    )
+
+def mount_record():
+    with open("/proc/self/mountinfo", "r") as stream:
+        for line in stream:
+            left, right = line.rstrip("\n").split(" - ", 1)
+            fields = left.split()
+            right_fields = right.split()
+            if unescape_mount(fields[4]) == mountpoint:
+                return (
+                    fields[0],
+                    fields[2],
+                    unescape_mount(fields[4]),
+                    right_fields[0],
+                    unescape_mount(right_fields[1]),
+                )
+    return None
+
+def fail(message):
+    print("usb_fs_op:", message, file=sys.stderr)
+    raise SystemExit(1)
+
+try:
+    dfd = os.open(directory, O_DIR)
+except OSError as exc:
+    fail("cannot safely open directory: " + str(exc))
+
+try:
+    dst = os.fstat(dfd)
+    if not stat.S_ISDIR(dst.st_mode):
+        fail("target is not a directory")
+    if dst.st_dev != expected_dev:
+        fail("directory is not on the validated USB filesystem")
+
+    source_stat = os.stat(source)
+    if not stat.S_ISBLK(source_stat.st_mode):
+        fail("validated source is no longer a block device")
+
+    source_mm = (
+        str(os.major(source_stat.st_rdev)) + ":" +
+        str(os.minor(source_stat.st_rdev))
+    )
+    directory_mm = (
+        str(os.major(dst.st_dev)) + ":" +
+        str(os.minor(dst.st_dev))
+    )
+
+    record_before = mount_record()
+    if record_before is None:
+        fail("USB mountpoint is absent from mountinfo")
+    if record_before[1] != source_mm:
+        fail("mountinfo device differs from validated block device")
+    if directory_mm != source_mm:
+        fail("opened directory is not on the validated USB device")
+    if mount_record() != record_before:
+        fail("mount changed during directory validation")
+
+    def regular_file(name, missing_ok=False):
+        try:
+            st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+        except FileNotFoundError:
+            if missing_ok:
+                return None
+            raise
+        if not stat.S_ISREG(st.st_mode):
+            fail("refusing non-regular file: " + name)
+        if st.st_dev != expected_dev:
+            fail("file is not on the validated USB filesystem: " + name)
+        return st
+
+    def safe_name(name):
+        if (
+            not isinstance(name, str)
+            or not name
+            or name in (".", "..")
+            or "/" in name
+            or "\x00" in name
+            or os.path.basename(name) != name
+        ):
+            fail("invalid basename: " + repr(name))
+
+    # Validate every caller-supplied filesystem name before dispatch.
+    if action in (
+        "append-event", "create", "exec-logread", "exec-btmon",
+        "size", "file-info", "unlink"
+    ):
+        if len(args) < 1:
+            fail("missing filename argument")
+        safe_name(args[0])
+    elif action == "rename":
+        if len(args) < 2:
+            fail("missing rename arguments")
+        safe_name(args[0])
+        safe_name(args[1])
+    elif action == "mkdir":
+        if len(args) < 1:
+            fail("missing directory name")
+        safe_name(args[0])
+    elif action == "cleanup":
+        if len(args) < 2:
+            fail("missing cleanup arguments")
+        if args[0]:
+            safe_name(args[0])
+
+    if action == "probe":
+        print("USB_DIRFD_OK")
+
+    elif action == "append-event":
+        name, stamp, message = args
+        flags = (
+            os.O_WRONLY | os.O_APPEND | os.O_CREAT |
+            os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+        )
+        fd = os.open(name, flags, 0o600, dir_fd=dfd)
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_dev != expected_dev:
+                fail("event file failed filesystem validation")
+            data = (stamp + " " + message + "\n").encode(
+                "utf-8", errors="replace"
+            )
+            view = memoryview(data)
+            while view:
+                written = os.write(fd, view)
+                if written <= 0:
+                    raise OSError("short event write")
+                view = view[written:]
+        finally:
+            os.close(fd)
+
+    elif action == "create":
+        name = args[0]
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+        fd = os.open(name, flags, 0o600, dir_fd=dfd)
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_dev != expected_dev:
+                fail("created file failed filesystem validation")
+        finally:
+            os.close(fd)
+
+    elif action == "exec-logread":
+        name = args[0]
+        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+        fd = os.open(name, flags, 0o600, dir_fd=dfd)
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_dev != expected_dev:
+            fail("message log failed file validation")
+        os.dup2(fd, 1)
+        os.dup2(fd, 2)
+        if fd not in (1, 2):
+            os.close(fd)
+        os.execvp("logread", ["logread", "-f"])
+
+    elif action == "exec-btmon":
+        name = args[0]
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+        fd = os.open(name, flags, 0o600, dir_fd=dfd)
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_dev != expected_dev:
+            fail("btmon capture file failed file validation")
+        os.set_inheritable(fd, True)
+        os.close(dfd)
+        dfd = -1
+        os.execvp("btmon", [
+            "btmon", "-i", "hci0", "-M",
+            "-w", "/proc/self/fd/" + str(fd)
+        ])
+
+    elif action == "size":
+        st = regular_file(args[0])
+        print(st.st_size)
+    elif action == "file-info":
+        st = regular_file(args[0], missing_ok=True)
+        print("MISSING" if st is None else st.st_size)
+
+    elif action == "unlink":
+        name = args[0]
+        st = regular_file(name, missing_ok=True)
+        if st is not None:
+            os.unlink(name, dir_fd=dfd)
+
+    elif action == "rename":
+        src, dst = args
+        regular_file(src)
+        dst_st = regular_file(dst, missing_ok=True)
+        if dst_st is not None:
+            fail("rename destination already exists: " + dst)
+        # Atomic rename that refuses to replace an existing destination.
+        # No unsafe fallback if renameat2 is unavailable.
+        import ctypes
+        import errno
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameat2 = getattr(libc, "renameat2", None)
+        if renameat2 is None:
+            fail("renameat2 is unavailable; refusing non-atomic rename")
+
+        renameat2.argtypes = [
+            ctypes.c_int, ctypes.c_char_p,
+            ctypes.c_int, ctypes.c_char_p,
+            ctypes.c_uint
+        ]
+        renameat2.restype = ctypes.c_int
+
+        rc = renameat2(
+            dfd, os.fsencode(src),
+            dfd, os.fsencode(dst),
+            1  # RENAME_NOREPLACE
+        )
+        if rc != 0:
+            err = ctypes.get_errno()
+            fail("renameat2(RENAME_NOREPLACE) failed: " +
+                 os.strerror(err))
+
+    elif action == "ble-used":
+        total = 0
+        for name in os.listdir(dfd):
+            if not (name.startswith("btmon-") and name.endswith(".btsnoop")):
+                continue
+            st = regular_file(name)
+            total += st.st_size
+        print((total + 1023) // 1024)
+
+    elif action == "cleanup":
+        keep_name = args[0]
+        retention_minutes = int(args[1])
+        cutoff = time.time() - retention_minutes * 60
+        for name in os.listdir(dfd):
+            if name == keep_name:
+                continue
+            if not (
+                (name.startswith("btmon-") and name.endswith(".btsnoop"))
+                or (name.startswith("events-") and name.endswith(".log"))
+            ):
+                continue
+            st = regular_file(name)
+            if st.st_mtime < cutoff:
+                os.unlink(name, dir_fd=dfd)
+
+    elif action == "mkdir":
+        name = args[0]
+        os.mkdir(name, 0o700, dir_fd=dfd)
+        child = os.open(name, O_DIR, dir_fd=dfd)
+        try:
+            st = os.fstat(child)
+            if not stat.S_ISDIR(st.st_mode) or st.st_dev != expected_dev:
+                fail("new directory failed filesystem validation")
+        finally:
+            os.close(child)
+
+    else:
+        fail("unknown action: " + action)
+
+finally:
+    if dfd >= 0:
+        os.close(dfd)
+
+PY_USB_FS
+}
+
+
+usb_fs_exec() {
+    local directory
+    directory="$1"
+    shift
+
+    [ -n "$USB_FS_DEV" ] || return 1
+    [ -n "$USB_SOURCE" ] || return 1
+
+    [ "$1" = "exec-logread" ] || [ "$1" = "exec-btmon" ] || return 1
+    exec python3 - "$directory" "$USB_FS_DEV" "$USB_SOURCE" "$USB_MOUNT" "$@" <<'PY_USB_FS'
+import os
+import sys
+import stat
+import time
+
+directory = sys.argv[1]
+expected_dev = int(sys.argv[2])
+source = sys.argv[3]
+mountpoint = sys.argv[4]
+action = sys.argv[5]
+args = sys.argv[6:]
+
+O_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+def unescape_mount(value):
+    import re
+    return re.sub(
+        r'\\([0-7]{3})',
+        lambda m: chr(int(m.group(1), 8)),
+        value
+    )
+
+def mount_record():
+    with open("/proc/self/mountinfo", "r") as stream:
+        for line in stream:
+            left, right = line.rstrip("\n").split(" - ", 1)
+            fields = left.split()
+            right_fields = right.split()
+            if unescape_mount(fields[4]) == mountpoint:
+                return (
+                    fields[0],
+                    fields[2],
+                    unescape_mount(fields[4]),
+                    right_fields[0],
+                    unescape_mount(right_fields[1]),
+                )
+    return None
+
+def fail(message):
+    print("usb_fs_op:", message, file=sys.stderr)
+    raise SystemExit(1)
+
+try:
+    dfd = os.open(directory, O_DIR)
+except OSError as exc:
+    fail("cannot safely open directory: " + str(exc))
+
+try:
+    dst = os.fstat(dfd)
+    if not stat.S_ISDIR(dst.st_mode):
+        fail("target is not a directory")
+    if dst.st_dev != expected_dev:
+        fail("directory is not on the validated USB filesystem")
+
+    source_stat = os.stat(source)
+    if not stat.S_ISBLK(source_stat.st_mode):
+        fail("validated source is no longer a block device")
+
+    source_mm = (
+        str(os.major(source_stat.st_rdev)) + ":" +
+        str(os.minor(source_stat.st_rdev))
+    )
+    directory_mm = (
+        str(os.major(dst.st_dev)) + ":" +
+        str(os.minor(dst.st_dev))
+    )
+
+    record_before = mount_record()
+    if record_before is None:
+        fail("USB mountpoint is absent from mountinfo")
+    if record_before[1] != source_mm:
+        fail("mountinfo device differs from validated block device")
+    if directory_mm != source_mm:
+        fail("opened directory is not on the validated USB device")
+    if mount_record() != record_before:
+        fail("mount changed during directory validation")
+
+    def regular_file(name, missing_ok=False):
+        try:
+            st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+        except FileNotFoundError:
+            if missing_ok:
+                return None
+            raise
+        if not stat.S_ISREG(st.st_mode):
+            fail("refusing non-regular file: " + name)
+        if st.st_dev != expected_dev:
+            fail("file is not on the validated USB filesystem: " + name)
+        return st
+
+    def safe_name(name):
+        if (
+            not isinstance(name, str)
+            or not name
+            or name in (".", "..")
+            or "/" in name
+            or "\x00" in name
+            or os.path.basename(name) != name
+        ):
+            fail("invalid basename: " + repr(name))
+
+    # Validate every caller-supplied filesystem name before dispatch.
+    if action in (
+        "append-event", "create", "exec-logread", "exec-btmon",
+        "size", "file-info", "unlink"
+    ):
+        if len(args) < 1:
+            fail("missing filename argument")
+        safe_name(args[0])
+    elif action == "rename":
+        if len(args) < 2:
+            fail("missing rename arguments")
+        safe_name(args[0])
+        safe_name(args[1])
+    elif action == "mkdir":
+        if len(args) < 1:
+            fail("missing directory name")
+        safe_name(args[0])
+    elif action == "cleanup":
+        if len(args) < 2:
+            fail("missing cleanup arguments")
+        if args[0]:
+            safe_name(args[0])
+
+    if action == "probe":
+        print("USB_DIRFD_OK")
+
+    elif action == "append-event":
+        name, stamp, message = args
+        flags = (
+            os.O_WRONLY | os.O_APPEND | os.O_CREAT |
+            os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+        )
+        fd = os.open(name, flags, 0o600, dir_fd=dfd)
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_dev != expected_dev:
+                fail("event file failed filesystem validation")
+            data = (stamp + " " + message + "\n").encode(
+                "utf-8", errors="replace"
+            )
+            view = memoryview(data)
+            while view:
+                written = os.write(fd, view)
+                if written <= 0:
+                    raise OSError("short event write")
+                view = view[written:]
+        finally:
+            os.close(fd)
+
+    elif action == "create":
+        name = args[0]
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+        fd = os.open(name, flags, 0o600, dir_fd=dfd)
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_dev != expected_dev:
+                fail("created file failed filesystem validation")
+        finally:
+            os.close(fd)
+
+    elif action == "exec-logread":
+        name = args[0]
+        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+        fd = os.open(name, flags, 0o600, dir_fd=dfd)
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_dev != expected_dev:
+            fail("message log failed file validation")
+        os.dup2(fd, 1)
+        os.dup2(fd, 2)
+        if fd not in (1, 2):
+            os.close(fd)
+        os.execvp("logread", ["logread", "-f"])
+
+    elif action == "exec-btmon":
+        name = args[0]
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+        fd = os.open(name, flags, 0o600, dir_fd=dfd)
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_dev != expected_dev:
+            fail("btmon capture file failed file validation")
+        os.set_inheritable(fd, True)
+        os.close(dfd)
+        dfd = -1
+        os.execvp("btmon", [
+            "btmon", "-i", "hci0", "-M",
+            "-w", "/proc/self/fd/" + str(fd)
+        ])
+
+    elif action == "size":
+        st = regular_file(args[0])
+        print(st.st_size)
+    elif action == "file-info":
+        st = regular_file(args[0], missing_ok=True)
+        print("MISSING" if st is None else st.st_size)
+
+    elif action == "unlink":
+        name = args[0]
+        st = regular_file(name, missing_ok=True)
+        if st is not None:
+            os.unlink(name, dir_fd=dfd)
+
+    elif action == "rename":
+        src, dst = args
+        regular_file(src)
+        dst_st = regular_file(dst, missing_ok=True)
+        if dst_st is not None:
+            fail("rename destination already exists: " + dst)
+        # Atomic rename that refuses to replace an existing destination.
+        # No unsafe fallback if renameat2 is unavailable.
+        import ctypes
+        import errno
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameat2 = getattr(libc, "renameat2", None)
+        if renameat2 is None:
+            fail("renameat2 is unavailable; refusing non-atomic rename")
+
+        renameat2.argtypes = [
+            ctypes.c_int, ctypes.c_char_p,
+            ctypes.c_int, ctypes.c_char_p,
+            ctypes.c_uint
+        ]
+        renameat2.restype = ctypes.c_int
+
+        rc = renameat2(
+            dfd, os.fsencode(src),
+            dfd, os.fsencode(dst),
+            1  # RENAME_NOREPLACE
+        )
+        if rc != 0:
+            err = ctypes.get_errno()
+            fail("renameat2(RENAME_NOREPLACE) failed: " +
+                 os.strerror(err))
+
+    elif action == "ble-used":
+        total = 0
+        for name in os.listdir(dfd):
+            if not (name.startswith("btmon-") and name.endswith(".btsnoop")):
+                continue
+            st = regular_file(name)
+            total += st.st_size
+        print((total + 1023) // 1024)
+
+    elif action == "cleanup":
+        keep_name = args[0]
+        retention_minutes = int(args[1])
+        cutoff = time.time() - retention_minutes * 60
+        for name in os.listdir(dfd):
+            if name == keep_name:
+                continue
+            if not (
+                (name.startswith("btmon-") and name.endswith(".btsnoop"))
+                or (name.startswith("events-") and name.endswith(".log"))
+            ):
+                continue
+            st = regular_file(name)
+            if st.st_mtime < cutoff:
+                os.unlink(name, dir_fd=dfd)
+
+    elif action == "mkdir":
+        name = args[0]
+        os.mkdir(name, 0o700, dir_fd=dfd)
+        child = os.open(name, O_DIR, dir_fd=dfd)
+        try:
+            st = os.fstat(child)
+            if not stat.S_ISDIR(st.st_mode) or st.st_dev != expected_dev:
+                fail("new directory failed filesystem validation")
+        finally:
+            os.close(child)
+
+    else:
+        fail("unknown action: " + action)
+
+finally:
+    if dfd >= 0:
+        os.close(dfd)
+
+PY_USB_FS
+}
+
+block_process_state() {
+    local reason="$*"
+
+    PROCESS_BLOCKED=1
+    USB_READY=0
+    USB_FS_DEV=""
+    USB_SOURCE=""
+    USB_UUID=""
+    LAST_USB_WRITE_CHECK=0
+
+    logger -t usb-log-collector -- \
+        "PROCESS_BLOCKED: $reason; automatic recovery disabled" 2>/dev/null || true
+}
+
+log_msg() {
+    local msg="$*" event_name stamp
+
+    logger -t usb-log-collector -- "$msg" 2>/dev/null || true
+
+    if [ "$USB_READY" -eq 1 ] &&
+       [ -n "$USB_FS_DEV" ] &&
+       [ -n "$USB_SOURCE" ]; then
+
+        event_name="events-$(date '+%Y%m%d').log"
+        stamp="$(date '+%F %T')"
+
+        usb_fs_op "$CAPDIR" append-event "$event_name" "$stamp" "$msg" \
+            >/dev/null 2>&1 || true
+    fi
+}
+
+proc_state() {
+    local pid="$1" line rest
+    local -a fields
+
+    [ -r "/proc/$pid/stat" ] || return 1
+    IFS= read -r line < "/proc/$pid/stat" || return 1
+    rest="${line##*) }"
+    [ "$rest" != "$line" ] || return 1
+    read -r -a fields <<< "$rest"
+    [ "${#fields[@]}" -ge 20 ] || return 1
+    [[ "${fields[19]}" =~ ^[0-9]+$ ]] || return 1
+    printf '%s %s\n' "${fields[0]}" "${fields[19]}"
+}
+
+proc_starttime() {
+    local v
+    v=$(proc_state "$1") || return 1
+    printf '%s\n' "${v#* }"
+}
+
+proc_cmdline() {
+    [ -r "/proc/$1/cmdline" ] || return 1
+    tr '\000' '\n' < "/proc/$1/cmdline"
+}
+
+pidfd_signal_child() {
+    local pid="$1" expected="$2" kind="$3" sig="$4" rc
+
+    python3 - "$pid" "$expected" "$kind" "$sig" <<'PY_PIDFD'
+import os
+import sys
+import signal
+
+pid_s, expected, kind, sig_name = sys.argv[1:5]
+
+def refuse(message, code=2):
+    print("PIDFD:", message, file=sys.stderr)
+    raise SystemExit(code)
+
+if not pid_s.isdigit() or not expected.isdigit():
+    refuse("invalid PID or starttime")
+
+if kind not in ("reader", "btmon"):
+    refuse("invalid process kind")
+
+signals = {
+    "TERM": signal.SIGTERM,
+    "INT": signal.SIGINT,
+}
+if sig_name not in signals:
+    refuse("invalid signal")
+
+pid = int(pid_s)
+
+try:
+    fd = os.pidfd_open(pid, 0)
+except ProcessLookupError:
+    raise SystemExit(1)
+except OSError as exc:
+    refuse("pidfd_open failed: " + str(exc))
+
+try:
+    try:
+        with open(f"/proc/{pid}/stat", "r") as stream:
+            stat_line = stream.read()
+    except FileNotFoundError:
+        raise SystemExit(1)
+    except OSError as exc:
+        refuse("cannot read process stat: " + str(exc))
+
+    end = stat_line.rfind(")")
+    if end < 0:
+        refuse("malformed process stat")
+
+    fields = stat_line[end + 2:].split()
+    if len(fields) < 20:
+        refuse("incomplete process stat")
+
+    state = fields[0]
+    starttime = fields[19]
+
+    if state == "Z" or starttime != expected:
+        raise SystemExit(1)
+
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as stream:
+            argv = stream.read().split(b"\0")
+    except FileNotFoundError:
+        raise SystemExit(1)
+    except OSError as exc:
+        refuse("cannot read process command line: " + str(exc))
+
+    argv = [arg for arg in argv if arg]
+
+    if not argv:
+        refuse("empty process command line")
+
+    executable = os.path.basename(argv[0])
+
+    if kind == "reader":
+        valid = executable == b"logread" and len(argv) >= 2 and argv[1] == b"-f"
+    else:
+        valid = False
+        if executable == b"btmon":
+            for i in range(len(argv) - 1):
+                if argv[i] == b"-i" and argv[i + 1] == b"hci0":
+                    valid = True
+                    break
+
+    if not valid:
+        refuse("process command line does not match expected child")
+
+    # Recheck the pinned process immediately before sending the signal.
+    try:
+        with open(f"/proc/{pid}/stat", "r") as stream:
+            stat_line = stream.read()
+    except FileNotFoundError:
+        raise SystemExit(1)
+    except OSError as exc:
+        refuse("cannot recheck process stat: " + str(exc))
+
+    end = stat_line.rfind(")")
+    if end < 0:
+        refuse("malformed process stat on final check")
+
+    fields = stat_line[end + 2:].split()
+    if len(fields) < 20:
+        refuse("incomplete process stat on final check")
+
+    final_state = fields[0]
+    final_starttime = fields[19]
+
+    if final_starttime != expected:
+        raise SystemExit(1)
+
+    if final_state in ("D", "Z"):
+        raise SystemExit(1)
+
+    try:
+        signal.pidfd_send_signal(fd, signals[sig_name], None, 0)
+    except ProcessLookupError:
+        raise SystemExit(1)
+    except OSError as exc:
+        refuse("pidfd_send_signal failed: " + str(exc))
+
+finally:
+    os.close(fd)
+
+raise SystemExit(0)
+PY_PIDFD
+
+    rc=$?
+
+    case "$rc" in
+        0) return 0 ;;
+        1) return 1 ;;
+        *)
+            block_process_state "PIDFD_SIGNAL_REFUSED kind=$kind pid=$pid"
+            return 2
+            ;;
+    esac
+}
+
+write_owner() {
+    local dir="$1" st tmp
+    [ -d "$dir" ] && [ ! -L "$dir" ] || return 1
+    st=$(proc_starttime "$$") || return 1
+    tmp="$dir/owner.tmp.$$"
+    ( set -o noclobber; printf '%s %s\n' "$$" "$st" > "$tmp" ) 2>/dev/null || return 1
+    mv "$tmp" "$dir/owner" || {
+        rm -f "$tmp"
+        return 1
+    }
+}
+
+read_owner() {
+    local dir="$1" pid st extra
+    [ -d "$dir" ] && [ ! -L "$dir" ] || return 1
+    [ -f "$dir/owner" ] && [ ! -L "$dir/owner" ] || return 1
+    read -r pid st extra < "$dir/owner" || return 1
+    [ -z "$extra" ] || return 1
+    [[ "$pid" =~ ^[0-9]+$ && "$st" =~ ^[0-9]+$ ]] || return 1
+    printf '%s %s\n' "$pid" "$st"
+}
+
+release_reap_lock() {
+    local owner current tmp
+
+    [ "$REAP_HELD" -eq 1 ] || return 0
+
+    owner=$(read_owner "$REAPDIR") || {
+        log_msg "REAP_LOCK_RELEASE_FAILED: cannot read owner"
+        return 1
+    }
+
+    current=$(proc_starttime "$$") || {
+        log_msg "REAP_LOCK_RELEASE_FAILED: cannot read own starttime"
+        return 1
+    }
+
+    [ "$owner" = "$$ $current" ] || {
+        log_msg "REAP_LOCK_RELEASE_FAILED: owner mismatch"
+        return 1
+    }
+
+    tmp="${REAPDIR}.owner.release.$$"
+    [ ! -e "$tmp" ] && [ ! -L "$tmp" ] || {
+        log_msg "REAP_LOCK_RELEASE_FAILED: temporary path already exists"
+        return 1
+    }
+
+    mv "$REAPDIR/owner" "$tmp" || {
+        log_msg "REAP_LOCK_RELEASE_FAILED: cannot move owner"
+        return 1
+    }
+
+    if rmdir "$REAPDIR" 2>/dev/null; then
+        REAP_HELD=0
+
+        if ! rm -f "$tmp"; then
+            log_msg "REAP_LOCK_RELEASED_BUT_TEMP_REMAINS path=$tmp"
+        fi
+
+        return 0
+    fi
+
+    if mv "$tmp" "$REAPDIR/owner"; then
+        log_msg "REAP_LOCK_RELEASE_FAILED: directory not empty; owner restored"
+    else
+        LOCK_RECOVERY_BLOCKED=1
+        log_msg "CRITICAL_REAP_LOCK_RESTORE_FAILED path=$REAPDIR temp=$tmp; reap lock retained"
+    fi
+
+    return 1
+}
+
+release_main_lock() {
+    local owner current tmp
+
+    [ "$LOCK_HELD" -eq 1 ] || return 0
+
+    owner=$(read_owner "$LOCKDIR") || {
+        log_msg "MAIN_LOCK_RELEASE_FAILED: cannot read owner"
+        return 1
+    }
+
+    current=$(proc_starttime "$$") || {
+        log_msg "MAIN_LOCK_RELEASE_FAILED: cannot read own starttime"
+        return 1
+    }
+
+    [ "$owner" = "$$ $current" ] || {
+        log_msg "MAIN_LOCK_RELEASE_FAILED: owner mismatch"
+        return 1
+    }
+
+    tmp="${LOCKDIR}.owner.release.$$"
+    [ ! -e "$tmp" ] && [ ! -L "$tmp" ] || {
+        log_msg "MAIN_LOCK_RELEASE_FAILED: temporary path already exists"
+        return 1
+    }
+
+    mv "$LOCKDIR/owner" "$tmp" || {
+        log_msg "MAIN_LOCK_RELEASE_FAILED: cannot move owner"
+        return 1
+    }
+
+    if rmdir "$LOCKDIR" 2>/dev/null; then
+        LOCK_HELD=0
+
+        if ! rm -f "$tmp"; then
+            log_msg "MAIN_LOCK_RELEASED_BUT_TEMP_REMAINS path=$tmp"
+        fi
+
+        return 0
+    fi
+
+    if mv "$tmp" "$LOCKDIR/owner"; then
+        log_msg "MAIN_LOCK_RELEASE_FAILED: directory not empty; owner restored"
+    else
+        LOCK_RECOVERY_BLOCKED=1
+        log_msg "CRITICAL_MAIN_LOCK_RESTORE_FAILED path=$LOCKDIR temp=$tmp; locks retained"
+    fi
+
+    return 1
+}
+
+
+acquire_reap_lock() {
+    if ! mkdir "$REAPDIR" 2>/dev/null; then
+        log_msg "START_REFUSED: reap lock exists; manual inspection required"
+        return 1
+    fi
+
+    REAP_HELD=1
+
+    if write_owner "$REAPDIR"; then
+        return 0
+    fi
+
+    log_msg "REAP_LOCK_CREATE_FAILED: owner write failed"
+
+    if rmdir "$REAPDIR" 2>/dev/null; then
+        REAP_HELD=0
+    else
+        LOCK_RECOVERY_BLOCKED=1
+        log_msg "CRITICAL_REAP_LOCK_ORPHANED path=$REAPDIR; manual inspection required"
+    fi
+
+    return 1
+}
+
+
+script_instance_exists() {
+    local f pid info state start start2 cmd
+
+    for f in /proc/[0-9]*/stat; do
+        [ -r "$f" ] || continue
+        pid="${f#/proc/}"
+        pid="${pid%/stat}"
+        [ "$pid" = "$$" ] && continue
+        [ "$pid" = "$PPID" ] && continue
+
+        info=$(proc_state "$pid") || continue
+        state="${info%% *}"
+        start="${info#* }"
+        [ "$state" = Z ] && continue
+
+        cmd=$(proc_cmdline "$pid" 2>/dev/null) || continue
+        if printf '%s\n' "$cmd" | grep -Fqx -e '/data/usb-log/usb-log-collector' -e '/data/usb-log/usb-log-collector.final'; then
+            start2=$(proc_starttime "$pid") || continue
+            [ "$start" = "$start2" ] && return 0
+        fi
+    done
+
+    return 1
+}
+
+acquire_main_lock() {
+    local owner pid st info state now stale_owner
+
+    script_instance_exists && {
+        log_msg "START_REFUSED: another collector instance exists"
+        return 1
+    }
+
+    # First try a fresh main lock.
+    if mkdir "$LOCKDIR" 2>/dev/null; then
+        LOCK_HELD=1
+
+        if ! write_owner "$LOCKDIR"; then
+            log_msg "MAIN_LOCK_CREATE_FAILED: owner write failed"
+
+            if rmdir "$LOCKDIR" 2>/dev/null; then
+                LOCK_HELD=0
+            else
+                LOCK_RECOVERY_BLOCKED=1
+                log_msg "CRITICAL_MAIN_LOCK_ORPHANED path=$LOCKDIR; manual inspection required"
+            fi
+
+            return 1
+        fi
+
+        return 0
+    fi
+
+    # Existing main lock: serialize stale-lock inspection.
+    acquire_reap_lock || return 1
+
+    owner=$(read_owner "$LOCKDIR" 2>/dev/null) || {
+        log_msg "START_REFUSED: main lock owner missing or invalid"
+        release_reap_lock || log_msg "CRITICAL: reap lock release failed"
+        return 1
+    }
+
+    read -r pid st <<< "$owner"
+
+    info=$(proc_state "$pid" 2>/dev/null) || info=""
+    if [ -n "$info" ]; then
+        state="${info%% *}"
+        now="${info#* }"
+
+        if [ "$now" = "$st" ] && [ "$state" != Z ]; then
+            log_msg "START_REFUSED: lock owner still alive PID=$pid"
+            release_reap_lock || log_msg "CRITICAL: reap lock release failed"
+            return 1
+        fi
+    elif [ -e "/proc/$pid" ]; then
+        log_msg "START_REFUSED: lock owner state ambiguous"
+        release_reap_lock || log_msg "CRITICAL: reap lock release failed"
+        return 1
+    fi
+
+    # Recheck owner before moving it.
+    owner=$(read_owner "$LOCKDIR" 2>/dev/null) || {
+        log_msg "START_REFUSED: main lock owner changed or became invalid"
+        release_reap_lock || log_msg "CRITICAL: reap lock release failed"
+        return 1
+    }
+
+    [ "$owner" = "$pid $st" ] || {
+        log_msg "START_REFUSED: main lock owner changed"
+        release_reap_lock || log_msg "CRITICAL: reap lock release failed"
+        return 1
+    }
+
+    stale_owner="${LOCKDIR}.owner.stale.$$"
+    [ ! -e "$stale_owner" ] && [ ! -L "$stale_owner" ] || {
+        log_msg "START_REFUSED: stale-owner temporary path already exists"
+        release_reap_lock || log_msg "CRITICAL: reap lock release failed"
+        return 1
+    }
+
+    if ! mv "$LOCKDIR/owner" "$stale_owner"; then
+        log_msg "START_REFUSED: cannot move stale owner"
+        release_reap_lock || log_msg "CRITICAL: reap lock release failed"
+        return 1
+    fi
+
+    if ! rmdir "$LOCKDIR" 2>/dev/null; then
+        if mv "$stale_owner" "$LOCKDIR/owner"; then
+            log_msg "STALE_MAIN_LOCK_REMOVE_FAILED: owner restored"
+            release_reap_lock || log_msg "CRITICAL: reap lock release failed"
+        else
+            LOCK_RECOVERY_BLOCKED=1
+            log_msg "CRITICAL_STALE_OWNER_RESTORE_FAILED path=$LOCKDIR temp=$stale_owner; reap lock retained"
+        fi
+        return 1
+    fi
+
+    if ! rm -f "$stale_owner" 2>/dev/null; then
+        logger -t usb-log-collector -- \
+            "STALE_LOCK_TEMP_CLEANUP_FAILED path=$stale_owner" 2>/dev/null || true
+    fi
+
+    if ! mkdir "$LOCKDIR" 2>/dev/null; then
+        log_msg "MAIN_LOCK_CREATE_FAILED after stale lock removal"
+        release_reap_lock || log_msg "CRITICAL: reap lock release failed"
+        return 1
+    fi
+
+    LOCK_HELD=1
+
+    if ! write_owner "$LOCKDIR"; then
+        log_msg "MAIN_LOCK_CREATE_FAILED: owner write failed after stale lock removal"
+
+        if rmdir "$LOCKDIR" 2>/dev/null; then
+            LOCK_HELD=0
+            release_reap_lock || log_msg "CRITICAL: reap lock release failed"
+        else
+            LOCK_RECOVERY_BLOCKED=1
+            log_msg "CRITICAL_MAIN_LOCK_ORPHANED path=$LOCKDIR; reap lock retained"
+        fi
+
+        return 1
+    fi
+
+    if ! release_reap_lock; then
+        log_msg "MAIN_LOCK_ACQUIRED_BUT_REAP_LOCK_RELEASE_FAILED"
+        return 1
+    fi
+
+    return 0
+}
+
+is_logread_f() {
+    local pid="$1" first second
+    [ -r "/proc/$pid/cmdline" ] || return 1
+    IFS= read -r -d '' first < "/proc/$pid/cmdline" || true
+    first="${first##*/}"
+    second=$(tr '\000' '\n' < "/proc/$pid/cmdline" 2>/dev/null | sed -n '2p')
+    [ "$first" = "logread" ] && [ "$second" = "-f" ]
+}
+
+is_btmon_hci0() {
+    local pid="$1"
+    local first
+    local i
+    local -a argv=()
+
+    [ -r "/proc/$pid/cmdline" ] || return 1
+
+    mapfile -d '' -t argv < "/proc/$pid/cmdline" 2>/dev/null || return 1
+    [ "${#argv[@]}" -ge 3 ] || return 1
+
+    first="${argv[0]##*/}"
+    [ "$first" = "btmon" ] || return 1
+
+    for ((i=1; i+1<${#argv[@]}; i++)); do
+        if [ "${argv[i]}" = "-i" ] &&
+           [ "${argv[i+1]}" = "hci0" ]; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+
+wait_child_identity() {
+    local pid="$1" kind="$2"
+    local attempt info state st verify verify_state verify_st
+    local observed_start=""
+
+    for ((attempt=0; attempt<30; attempt++)); do
+        [ -e "/proc/$pid" ] || return 1
+
+        info=$(proc_state "$pid" 2>/dev/null) || {
+            sleep 0.1
+            continue
+        }
+
+        state="${info%% *}"
+        st="${info#* }"
+
+        [ "$state" != Z ] || return 1
+
+        if [ -z "$observed_start" ]; then
+            observed_start="$st"
+        elif [ "$st" != "$observed_start" ]; then
+            return 2
+        fi
+
+        case "$kind" in
+            reader)
+                is_logread_f "$pid" || {
+                    sleep 0.1
+                    continue
+                }
+                ;;
+            btmon)
+                is_btmon_hci0 "$pid" || {
+                    sleep 0.1
+                    continue
+                }
+                ;;
+            *)
+                return 2
+                ;;
+        esac
+
+        verify=$(proc_state "$pid" 2>/dev/null) || {
+            sleep 0.1
+            continue
+        }
+
+        verify_state="${verify%% *}"
+        verify_st="${verify#* }"
+
+        [ "$verify_st" = "$observed_start" ] || return 2
+        [ "$verify_state" != Z ] || return 1
+
+        case "$kind" in
+            reader) is_logread_f "$pid" || continue ;;
+            btmon)  is_btmon_hci0 "$pid" || continue ;;
+        esac
+
+        printf '%s %s\n' "$verify_state" "$verify_st"
+        return 0
+    done
+
+    [ -e "/proc/$pid" ] || return 1
+
+    info=$(proc_state "$pid" 2>/dev/null) || return 2
+    state="${info%% *}"
+    st="${info#* }"
+
+    [ "$state" != Z ] || return 1
+    [ -n "$observed_start" ] && [ "$st" = "$observed_start" ] || return 2
+
+    return 2
+}
+
+find_existing_process() {
+    local kind="$1" f pid info state
+
+    EXISTING_PROCESS=""
+
+    case "$kind" in
+        reader|btmon) ;;
+        *)
+            block_process_state "PROCESS_SCAN_INVALID_KIND kind=$kind"
+            return 2
+            ;;
+    esac
+
+    for f in /proc/[0-9]*/stat; do
+        [ -e "$f" ] || continue
+
+        if [ ! -r "$f" ]; then
+            [ -e "$f" ] || continue
+            block_process_state "PROCESS_SCAN_STAT_UNREADABLE path=$f"
+            return 2
+        fi
+
+        pid="${f#/proc/}"
+        pid="${pid%/stat}"
+
+        info=$(proc_state "$pid" 2>/dev/null) || {
+            [ -e "$f" ] || continue
+            block_process_state "PROCESS_SCAN_STAT_UNAVAILABLE pid=$pid"
+            return 2
+        }
+
+        state="${info%% *}"
+        [ "$state" = Z ] && continue
+
+        if [ ! -e "/proc/$pid" ]; then
+            continue
+        fi
+
+        if [ ! -r "/proc/$pid/cmdline" ]; then
+            [ -e "/proc/$pid" ] || continue
+            block_process_state "PROCESS_SCAN_CMDLINE_UNREADABLE pid=$pid"
+            return 2
+        fi
+
+        if [ "$kind" = reader ]; then
+            if is_logread_f "$pid"; then
+                EXISTING_PROCESS="$pid"
+                return 0
+            fi
+        else
+            if is_btmon_hci0 "$pid"; then
+                EXISTING_PROCESS="$pid"
+                return 0
+            fi
+        fi
+    done
+
+    return 1
+}
+
+reconcile_pid() {
+    local -n pid_ref="$1"
+    local -n start_ref="$2"
+    local kind="$3"
+    local pid info state now
+
+    [ -n "$pid_ref" ] || return 1
+    pid="$pid_ref"
+
+    info=$(proc_state "$pid" 2>/dev/null) || {
+        if [ ! -e "/proc/$pid" ]; then
+            wait "$pid" 2>/dev/null || true
+            pid_ref=""
+            start_ref=""
+            return 1
+        fi
+        block_process_state "$kind PID=$pid exists but /proc state is unreadable"
+        return 2
+    }
+
+    state="${info%% *}"
+    now="${info#* }"
+
+    if [ "$state" = Z ]; then
+        wait "$pid" 2>/dev/null || true
+        pid_ref=""
+        start_ref=""
+        return 1
+    fi
+
+    if [ -z "$start_ref" ]; then
+        block_process_state "$kind PID=$pid has no recorded starttime"
+        return 2
+    fi
+
+    if [ "$now" != "$start_ref" ]; then
+        wait "$pid" 2>/dev/null || true
+        pid_ref=""
+        start_ref=""
+        return 1
+    fi
+
+    if [ "$kind" = reader ]; then
+        is_logread_f "$pid" || {
+            block_process_state "reader PID=$pid command line cannot be confirmed"
+            return 2
+        }
+    else
+        is_btmon_hci0 "$pid" || {
+            block_process_state "btmon PID=$pid command line cannot be confirmed"
+            return 2
+        }
+    fi
+
+    return 0
+}
+
+wait_child_gone() {
+    local pid="$1" expected="$2" seconds="$3"
+    local i info state now
+
+    for ((i=0; i<seconds; i++)); do
+        info=$(proc_state "$pid" 2>/dev/null) || {
+            [ ! -e "/proc/$pid" ] || return 1
+            wait "$pid" 2>/dev/null || true
+            return 0
+        }
+
+        state="${info%% *}"
+        now="${info#* }"
+
+        [ "$now" = "$expected" ] || {
+            wait "$pid" 2>/dev/null || true
+            return 0
+        }
+
+        [ "$state" != Z ] || {
+            wait "$pid" 2>/dev/null || true
+            return 0
+        }
+
+        [ "$state" != D ] || return 1
+        sleep 1
+    done
+
+    return 1
+}
+
+stop_reader() {
+    local pid="$READER_PID" st="$READER_START" r info state existing
+
+    if [ -z "$pid" ]; then
+        find_existing_process reader
+        r=$?
+        [ "$r" -eq 1 ] && return 0
+        [ "$r" -eq 0 ] || return 1
+        existing="$EXISTING_PROCESS"
+        log_msg "READER_UNTRACKED_PROCESS_PRESENT pid=$existing; refusing to signal"
+        return 1
+    fi
+
+    reconcile_pid READER_PID READER_START reader
+    r=$?
+
+    [ "$r" -eq 1 ] && return 0
+    [ "$r" -eq 0 ] || return 1
+
+    info=$(proc_state "$pid") || return 1
+    state="${info%% *}"
+    [ "$state" != D ] || return 1
+
+    info=$(proc_state "$pid") || return 1
+    [ "${info#* }" = "$st" ] || return 1
+    is_logread_f "$pid" || return 1
+
+    pidfd_signal_child "$pid" "$st" reader TERM
+    r=$?
+    [ "$r" -ne 2 ] || return 1
+
+    wait_child_gone "$pid" "$st" 15 || return 1
+    READER_PID=""
+    READER_START=""
+    return 0
+}
+
+stop_btmon() {
+    local pid="$BTMON_PID" st="$BTMON_START" r info state existing
+
+    if [ -z "$pid" ]; then
+        find_existing_process btmon
+        r=$?
+        [ "$r" -eq 1 ] && return 0
+        [ "$r" -eq 0 ] || return 1
+        existing="$EXISTING_PROCESS"
+        log_msg "BTMON_UNTRACKED_PROCESS_PRESENT pid=$existing; refusing to signal"
+        return 1
+    fi
+
+    reconcile_pid BTMON_PID BTMON_START btmon
+    r=$?
+
+    if [ "$r" -eq 1 ]; then
+        BTMON_FILE=""
+        return 0
+    fi
+
+    [ "$r" -eq 0 ] || return 1
+
+    info=$(proc_state "$pid") || return 1
+    state="${info%% *}"
+    [ "$state" != D ] || return 1
+
+    info=$(proc_state "$pid") || return 1
+    [ "${info#* }" = "$st" ] || return 1
+    is_btmon_hci0 "$pid" || return 1
+
+    pidfd_signal_child "$pid" "$st" btmon INT
+    r=$?
+    [ "$r" -ne 2 ] || return 1
+
+    wait_child_gone "$pid" "$st" 30 || return 1
+    BTMON_PID=""
+    BTMON_START=""
+    BTMON_FILE=""
+    return 0
+}
+
+start_reader() {
+    local r pid st info state existing now attempt
+
+    if [ -n "$READER_PID" ]; then
+        reconcile_pid READER_PID READER_START reader
+        r=$?
+        [ "$r" -eq 0 ] && return 0
+        [ "$r" -eq 1 ] || return 1
+    fi
+
+    [ "$PROCESS_BLOCKED" -eq 0 ] || return 1
+    [ "$USB_READY" -eq 1 ] || return 1
+    [ -d "$CAPDIR" ] && [ ! -L "$CAPDIR" ] || return 1
+
+    rotation_usb_guard force || return 1
+
+    find_existing_process reader
+    r=$?
+    if [ "$r" -eq 0 ]; then
+        existing="$EXISTING_PROCESS"
+        log_msg "READER_START_BLOCKED: existing logread -f PID=$existing"
+        return 1
+    fi
+    [ "$r" -eq 1 ] || return 1
+
+    now=$(date +%s)
+    [ $((now - LAST_READER_START)) -ge 5 ] || return 1
+
+    rotation_usb_guard force || return 1
+    [ "$STOPPING" -eq 0 ] || return 1
+    LAST_READER_START="$now"
+
+    usb_fs_exec "$USB_MOUNT" exec-logread "${MESSAGE_LOG##*/}" &
+    pid=$!
+    READER_PID="$pid"
+    READER_START=""
+    info=$(wait_child_identity "$pid" reader)
+    r=$?
+
+    if [ "$r" -eq 1 ]; then
+        wait "$pid" 2>/dev/null || true
+        READER_PID=""
+        READER_START=""
+        return 1
+    fi
+
+    if [ "$r" -ne 0 ]; then
+        block_process_state "READER_START_IDENTITY_AMBIGUOUS pid=$pid"
+        return 1
+    fi
+
+    state="${info%% *}"
+    st="${info#* }"
+    READER_START="$st"
+
+    if [ "$STOPPING" -eq 1 ]; then
+        stop_reader || log_msg "READER_STOP_AFTER_START_INCOMPLETE"
+        return 1
+    fi
+
+    log_msg "READER_STARTED pid=$pid"
+    return 0
+}
+
+check_reader_health() {
+    local r
+
+    [ "$PROCESS_BLOCKED" -eq 0 ] || return 1
+
+    [ -n "$READER_PID" ] || {
+        start_reader || true
+        return
+    }
+
+    reconcile_pid READER_PID READER_START reader
+    r=$?
+
+    if [ "$r" -eq 1 ]; then
+        log_msg "READER_EXITED"
+        LAST_READER_START=0
+        start_reader || true
+    elif [ "$r" -eq 2 ]; then
+        log_msg "READER_STATE_AMBIGUOUS; not starting duplicate"
+    fi
+}
+
+new_btmon_filename() {
+    local stamp
+    stamp=$(date '+%Y%m%d-%H%M%S')
+    printf 'btmon-%s-%s-%s.btsnoop\n' "$stamp" "$$" "$RANDOM"
+}
+
+ble_used_kb() {
+    usb_fs_op "$CAPDIR" ble-used
+}
+
+start_btmon() {
+    local r used free_kb file pid st info state existing now attempt file_info
+
+    if [ -n "$BTMON_PID" ]; then
+        reconcile_pid BTMON_PID BTMON_START btmon
+        r=$?
+
+        [ "$r" -eq 0 ] && return 0
+        [ "$r" -eq 1 ] || return 1
+
+        if [ -n "$BTMON_FILE" ] && [ -n "$USB_FS_DEV" ]; then
+            file_info=$(usb_fs_op "$CAPDIR" file-info "$BTMON_FILE" 2>/dev/null) || return 1
+            if [ "$file_info" = "0" ]; then
+                usb_fs_op "$CAPDIR" unlink "$BTMON_FILE" || return 1
+            fi
+        fi
+
+        BTMON_FILE=""
+    fi
+
+    [ "$PROCESS_BLOCKED" -eq 0 ] || return 1
+    [ "$USB_READY" -eq 1 ] || return 1
+    [ -d "$CAPDIR" ] && [ ! -L "$CAPDIR" ] || return 1
+
+    rotation_usb_guard force || return 1
+
+    now=$(date +%s)
+    [ $((now - LAST_BT_START)) -ge 30 ] || return 1
+    LAST_BT_START="$now"
+
+    find_existing_process btmon
+    r=$?
+    if [ "$r" -eq 0 ]; then
+        existing="$EXISTING_PROCESS"
+        log_msg "BTMON_START_BLOCKED: existing btmon -i hci0 PID=$existing"
+        return 1
+    fi
+    [ "$r" -eq 1 ] || return 1
+
+    used=$(ble_used_kb) || return 1
+    [ $((used + SEGMENT_KB)) -le "$BLE_BUDGET_KB" ] || return 1
+
+    free_kb=$(df -Pk "$USB_MOUNT" 2>/dev/null | awk 'NR==2 {print $4}')
+    [[ "$free_kb" =~ ^[0-9]+$ ]] || return 1
+    [ "$free_kb" -ge "$MIN_FREE_KB" ] || return 1
+
+    file=$(new_btmon_filename)
+
+    rotation_usb_guard force || return 1
+    [ "$STOPPING" -eq 0 ] || return 1
+
+    # exec-btmon performs O_EXCL creation relative to the validated dirfd.
+    # btmon receives that already-open descriptor; no path-based USB write.
+    usb_fs_exec "$CAPDIR" exec-btmon "$file" >/dev/null 2>&1 &
+    pid=$!
+    BTMON_PID="$pid"
+    BTMON_START=""
+    BTMON_FILE="$file"
+
+    info=$(wait_child_identity "$pid" btmon)
+    r=$?
+
+    if [ "$r" -eq 1 ]; then
+        wait "$pid" 2>/dev/null || true
+        file_info=$(usb_fs_op "$CAPDIR" file-info "$file" 2>/dev/null) || true
+        if [ "$file_info" = "0" ]; then
+            usb_fs_op "$CAPDIR" unlink "$file" >/dev/null 2>&1 || true
+        fi
+        BTMON_PID=""
+        BTMON_START=""
+        BTMON_FILE=""
+        return 1
+    fi
+
+    if [ "$r" -ne 0 ]; then
+        block_process_state "BTMON_START_IDENTITY_AMBIGUOUS pid=$pid"
+        return 1
+    fi
+
+    state="${info%% *}"
+    st="${info#* }"
+    BTMON_START="$st"
+
+    if [ "$STOPPING" -eq 1 ]; then
+        stop_btmon || log_msg "BTMON_STOP_AFTER_START_INCOMPLETE"
+        return 1
+    fi
+
+    log_msg "BTMON_STARTED pid=$pid file=$file"
+    return 0
+}
+
+check_btmon_health() {
+    local r file_info old_file
+
+    [ "$PROCESS_BLOCKED" -eq 0 ] || return 1
+
+    [ -n "$BTMON_PID" ] || {
+        start_btmon || true
+        return
+    }
+
+    reconcile_pid BTMON_PID BTMON_START btmon
+    r=$?
+
+    if [ "$r" -eq 1 ]; then
+        log_msg "BTMON_EXITED"
+
+        old_file="$BTMON_FILE"
+        if [ -n "$old_file" ] && [ "$USB_READY" -eq 1 ] &&
+           [ -n "$USB_FS_DEV" ] && [ -n "$USB_SOURCE" ]; then
+            file_info=$(usb_fs_op "$CAPDIR" file-info "$old_file" 2>/dev/null) || file_info=""
+            if [ "$file_info" = "0" ]; then
+                usb_fs_op "$CAPDIR" unlink "$old_file" >/dev/null 2>&1 || true
+            fi
+        fi
+
+        BTMON_FILE=""
+        LAST_BT_START=0
+        start_btmon || true
+
+    elif [ "$r" -eq 2 ]; then
+        log_msg "BTMON_STATE_AMBIGUOUS; not starting duplicate"
+    fi
+}
+
+check_btmon_rotation() {
+    local bytes size_kb
+
+    [ "$PROCESS_BLOCKED" -eq 0 ] || return 1
+    [ "$USB_READY" -eq 1 ] || return 1
+    [ -n "$BTMON_PID" ] && [ -n "$BTMON_FILE" ] || return 0
+
+    bytes=$(usb_fs_op "$CAPDIR" file-info "$BTMON_FILE" 2>/dev/null) || {
+        log_msg "BTMON_ROTATION_ERROR: safe file-info failed"
+        return 1
+    }
+
+    if [ "$bytes" = "MISSING" ]; then
+        log_msg "BTMON_ROTATION_ABORT: capture file is missing"
+        stop_btmon || log_msg "BTMON_ROTATION_STOP_INCOMPLETE"
+        return 1
+    fi
+
+    [[ "$bytes" =~ ^[0-9]+$ ]] || {
+        log_msg "BTMON_ROTATION_ERROR: invalid file-info result"
+        return 1
+    }
+
+    size_kb=$((bytes / 1024))
+    [ "$size_kb" -ge "$SEGMENT_KB" ] || return 0
+
+    if ! stop_btmon; then
+        log_msg "BTMON_ROTATION_STOP_INCOMPLETE"
+        return 1
+    fi
+
+    [ "$PROCESS_BLOCKED" -eq 0 ] || return 1
+    [ "$USB_READY" -eq 1 ] || return 1
+
+    LAST_BT_START=0
+
+    if ! start_btmon; then
+        log_msg "BTMON_ROTATION_RESTART_FAILED"
+        return 1
+    fi
+
+    return 0
+}
+
+restart_reader_after_rotation() {
+    LAST_READER_START=0
+
+    if ! start_reader; then
+        log_msg "MESSAGE_ROTATION_READER_RESTART_FAILED"
+        return 1
+    fi
+
+    return 0
+}
+
+rotation_usb_guard() {
+    local force_write="${1:-0}"
+
+    [ "$PROCESS_BLOCKED" -eq 0 ] || return 1
+    [ "$USB_READY" -eq 1 ] || return 1
+
+    if ! check_usb; then
+        set_usb_not_ready
+        stop_btmon || logger -t usb-log-collector -- "USB_FAILURE: btmon stop incomplete"
+        stop_reader || logger -t usb-log-collector -- "USB_FAILURE: logread stop incomplete"
+        return 1
+    fi
+
+    [ "$PROCESS_BLOCKED" -eq 0 ] || return 1
+    [ "$USB_READY" -eq 1 ] || return 1
+
+    # Force a real write test only at explicitly selected critical points.
+    if [ "$force_write" = "force" ]; then
+        LAST_USB_WRITE_CHECK=0
+        if ! check_usb_writable; then
+            set_usb_not_ready
+            stop_btmon || logger -t usb-log-collector -- "USB_WRITE_FAILURE: btmon stop incomplete"
+            stop_reader || logger -t usb-log-collector -- "USB_WRITE_FAILURE: logread stop incomplete"
+            return 1
+        fi
+    fi
+
+    return 0
+}
+
+rotation_recover_reader() {
+    [ "$PROCESS_BLOCKED" -eq 0 ] || return 1
+    [ "$USB_READY" -eq 1 ] || return 1
+
+    rotation_usb_guard || return 1
+
+    restart_reader_after_rotation
+}
+
+
+check_message_rotation() {
+    local bytes size_kb i info src dst
+
+    rotation_usb_guard || return 1
+
+    info=$(usb_fs_op "$USB_MOUNT" file-info "${MESSAGE_LOG##*/}") || {
+        log_msg "MESSAGE_ROTATION_ERROR: cannot inspect current log"
+        return 1
+    }
+
+    [ "$info" != "MISSING" ] || return 0
+
+    [[ "$info" =~ ^[0-9]+$ ]] || {
+        log_msg "MESSAGE_ROTATION_ERROR: invalid current log size"
+        return 1
+    }
+
+    bytes="$info"
+    size_kb=$((bytes / 1024))
+    [ "$size_kb" -ge "$MESSAGE_ROTATE_KB" ] || return 0
+
+    for ((i=1; i<=10; i++)); do
+        rotation_usb_guard || return 1
+        info=$(usb_fs_op "$USB_MOUNT" file-info \
+            "${MESSAGE_LOG##*/}.$i") || {
+            log_msg "MESSAGE_ROTATION_ABORT: unsafe archive .$i"
+            return 1
+        }
+    done
+
+    rotation_usb_guard force || return 1
+
+    if ! stop_reader; then
+        log_msg "MESSAGE_ROTATION_ABORT: reader still active"
+        return 1
+    fi
+
+    rotation_usb_guard force || {
+        rotation_recover_reader || \
+            log_msg "MESSAGE_ROTATION_RECOVERY_FAILED"
+        return 1
+    }
+
+    for ((i=1; i<=10; i++)); do
+        rotation_usb_guard || {
+            rotation_recover_reader || \
+                log_msg "MESSAGE_ROTATION_RECOVERY_FAILED"
+            return 1
+        }
+        info=$(usb_fs_op "$USB_MOUNT" file-info \
+            "${MESSAGE_LOG##*/}.$i") || {
+            log_msg "MESSAGE_ROTATION_ABORT: archive changed .$i"
+            rotation_recover_reader || \
+                log_msg "MESSAGE_ROTATION_RECOVERY_FAILED"
+            return 1
+        }
+    done
+
+    rotation_usb_guard || {
+        rotation_recover_reader || \
+            log_msg "MESSAGE_ROTATION_RECOVERY_FAILED"
+        return 1
+    }
+
+    info=$(usb_fs_op "$USB_MOUNT" file-info \
+        "${MESSAGE_LOG##*/}.10") || {
+        log_msg "MESSAGE_ROTATION_FAILED: cannot inspect archive .10"
+        rotation_recover_reader || \
+            log_msg "MESSAGE_ROTATION_RECOVERY_FAILED"
+        return 1
+    }
+
+    if [ "$info" != "MISSING" ]; then
+        rotation_usb_guard || {
+            rotation_recover_reader || \
+                log_msg "MESSAGE_ROTATION_RECOVERY_FAILED"
+            return 1
+        }
+        if ! usb_fs_op "$USB_MOUNT" unlink "${MESSAGE_LOG##*/}.10"; then
+            log_msg "MESSAGE_ROTATION_FAILED: cannot remove archive .10"
+            rotation_recover_reader || \
+                log_msg "MESSAGE_ROTATION_RECOVERY_FAILED"
+            return 1
+        fi
+    fi
+
+    for ((i=9; i>=1; i--)); do
+        src="${MESSAGE_LOG##*/}.$i"
+        dst="${MESSAGE_LOG##*/}.$((i+1))"
+
+        rotation_usb_guard || {
+            rotation_recover_reader || \
+                log_msg "MESSAGE_ROTATION_RECOVERY_FAILED"
+            return 1
+        }
+
+        info=$(usb_fs_op "$USB_MOUNT" file-info "$src") || {
+            log_msg "MESSAGE_ROTATION_ABORT: cannot inspect $src"
+            rotation_recover_reader || \
+                log_msg "MESSAGE_ROTATION_RECOVERY_FAILED"
+            return 1
+        }
+
+        if [ "$info" != "MISSING" ]; then
+            if ! usb_fs_op "$USB_MOUNT" rename "$src" "$dst"; then
+                log_msg "MESSAGE_ROTATION_FAILED: cannot shift $src"
+                rotation_recover_reader || \
+                    log_msg "MESSAGE_ROTATION_RECOVERY_FAILED"
+                return 1
+            fi
+        fi
+    done
+
+    rotation_usb_guard || {
+        rotation_recover_reader || \
+            log_msg "MESSAGE_ROTATION_RECOVERY_FAILED"
+        return 1
+    }
+
+    info=$(usb_fs_op "$USB_MOUNT" file-info "${MESSAGE_LOG##*/}") || {
+        log_msg "MESSAGE_ROTATION_FAILED: cannot inspect current log"
+        rotation_recover_reader || \
+            log_msg "MESSAGE_ROTATION_RECOVERY_FAILED"
+        return 1
+    }
+
+    if [ "$info" != "MISSING" ]; then
+        if ! usb_fs_op "$USB_MOUNT" rename \
+            "${MESSAGE_LOG##*/}" "${MESSAGE_LOG##*/}.1"; then
+            log_msg "MESSAGE_ROTATION_FAILED: cannot archive current log"
+            rotation_recover_reader || \
+                log_msg "MESSAGE_ROTATION_RECOVERY_FAILED"
+            return 1
+        fi
+    fi
+
+    rotation_usb_guard force || {
+        rotation_recover_reader || \
+            log_msg "MESSAGE_ROTATION_RECOVERY_FAILED"
+        return 1
+    }
+
+    if ! usb_fs_op "$USB_MOUNT" create "${MESSAGE_LOG##*/}"; then
+        log_msg "MESSAGE_ROTATION_FAILED: cannot create new message log"
+        rotation_recover_reader || \
+            log_msg "MESSAGE_ROTATION_RECOVERY_FAILED"
+        return 1
+    fi
+
+    if ! rotation_recover_reader; then
+        log_msg "MESSAGE_ROTATION_FAILED: reader did not restart"
+        return 1
+    fi
+
+    log_msg "MESSAGE_LOG_ROTATED"
+    return 0
+}
+
+
+cleanup_old_ble() {
+    [ "$PROCESS_BLOCKED" -eq 0 ] || return 1
+    [ "$USB_READY" -eq 1 ] || return 1
+    [ -d "$CAPDIR" ] && [ ! -L "$CAPDIR" ] || return 1
+
+    if ! check_usb_writable; then
+        log_msg "BLE_CLEANUP_ABORT: USB validation/write check failed status=$USB_STATUS"
+        set_usb_not_ready
+        stop_btmon || logger -t usb-log-collector -- "BLE_CLEANUP: btmon stop incomplete"
+        stop_reader || logger -t usb-log-collector -- "BLE_CLEANUP: logread stop incomplete"
+        return 1
+    fi
+
+    [ "$PROCESS_BLOCKED" -eq 0 ] || return 1
+    [ "$USB_READY" -eq 1 ] || return 1
+
+    usb_fs_op "$CAPDIR" cleanup "${BTMON_FILE##*/}" "$BLE_RETENTION_MIN" || {
+        log_msg "BLE_CLEANUP_SAFE_HELPER_FAILED"
+        return 1
+    }
+
+    LAST_CLEANUP=$(date +%s) || return 1
+    return 0
+}
+
+MOUNT_REJECTED=0
+
+check_usb_mountpoint() {
+    [ -d "$USB_MOUNT" ] || {
+        USB_STATUS="MOUNTPOINT_MISSING"
+        return 1
+    }
+
+    [ ! -L "$USB_MOUNT" ] || {
+        USB_STATUS="MOUNTPOINT_IS_SYMLINK"
+        return 1
+    }
+
+    return 0
+}
+
+validate_usb_device() {
+    local dev="${1:-}" typ label uuid props
+    local sysfs sys_path
+    local attempt udev_bus udev_type
+
+    VALIDATED_UUID=""
+
+    [ -b "$dev" ] || {
+        USB_STATUS="DEVICE_NOT_BLOCK"
+        return 1
+    }
+
+    typ=$(blkid -c /dev/null -s TYPE -o value "$dev" 2>/dev/null) || {
+        USB_STATUS="BLKID_TYPE_FAILED"
+        return 2
+    }
+
+    label=$(blkid -c /dev/null -s LABEL -o value "$dev" 2>/dev/null) || {
+        USB_STATUS="BLKID_LABEL_FAILED"
+        return 2
+    }
+
+    uuid=$(blkid -c /dev/null -s UUID -o value "$dev" 2>/dev/null) || {
+        USB_STATUS="BLKID_UUID_FAILED"
+        return 2
+    }
+
+    [ "$typ" = "ext4" ] || {
+        USB_STATUS="WRONG_FS_TYPE"
+        return 1
+    }
+
+    [ "$label" = "$USB_LABEL" ] || {
+        USB_STATUS="WRONG_LABEL"
+        return 1
+    }
+
+    [ -n "$uuid" ] || {
+        USB_STATUS="UUID_MISSING"
+        return 1
+    }
+
+    # Независимая проверка USB-пути и типа раздела через sysfs.
+    sysfs="/sys/class/block/${dev##*/}"
+
+    [ -e "$sysfs" ] || {
+        USB_STATUS="SYSFS_DEVICE_MISSING"
+        return 2
+    }
+
+    [ -f "$sysfs/partition" ] || {
+        USB_STATUS="DEVICE_NOT_PARTITION"
+        return 1
+    }
+
+    sys_path=$(readlink -f "$sysfs" 2>/dev/null) || {
+        USB_STATUS="SYSFS_PATH_FAILED"
+        return 2
+    }
+
+    [[ "$sys_path" =~ /usb[0-9]+/[^/]+(/|$) ]] || {
+        USB_STATUS="DEVICE_NOT_USB"
+        return 1
+    }
+
+    # До трёх попыток получения свойств udev.
+    props=""
+    udev_bus=""
+    udev_type=""
+
+    for attempt in 1 2 3; do
+        if props=$(udevadm info --query=property --name="$dev" 2>/dev/null); then
+            udev_bus=$(printf '%s
+' "$props" |
+                sed -n 's/^ID_BUS=//p' | head -n 1)
+
+            udev_type=$(printf '%s
+' "$props" |
+                sed -n 's/^DEVTYPE=//p' | head -n 1)
+
+            if [ -n "$udev_bus" ] && [ "$udev_bus" != "usb" ]; then
+                USB_STATUS="DEVICE_NOT_USB"
+                return 1
+            fi
+
+            if [ -n "$udev_type" ] && [ "$udev_type" != "partition" ]; then
+                USB_STATUS="DEVICE_NOT_PARTITION"
+                return 1
+            fi
+
+            [ "$udev_bus" = "usb" ] &&
+            [ "$udev_type" = "partition" ] && break
+        fi
+
+        [ "$attempt" -lt 3 ] && sleep 1
+    done
+
+    # USB и раздел подтверждены sysfs.
+    VALIDATED_UUID="$uuid"
+    return 0
+}
+
+check_usb_writable() {
+    local mount_dev now testfile
+
+    USB_FS_DEV=""
+
+    mountpoint -q "$USB_MOUNT" || {
+        USB_STATUS="USB_NOT_MOUNTED_FOR_WRITE"
+        return 1
+    }
+
+    [ -d "$USB_MOUNT" ] && [ ! -L "$USB_MOUNT" ] || {
+        USB_STATUS="MOUNTPOINT_INVALID"
+        return 1
+    }
+
+    [ -n "$USB_SOURCE" ] || {
+        USB_STATUS="USB_SOURCE_NOT_VALIDATED"
+        return 1
+    }
+
+    mount_dev=$(python3 - "$USB_MOUNT" "$USB_SOURCE" <<'PY_USB_VALIDATE'
+import os
+import re
+import stat
+import sys
+
+mountpoint, source = sys.argv[1:3]
+
+def unescape(value):
+    return re.sub(
+        r'\\([0-7]{3})',
+        lambda m: chr(int(m.group(1), 8)),
+        value
+    )
+
+def record():
+    with open("/proc/self/mountinfo", "r") as stream:
+        for line in stream:
+            left, right = line.rstrip("\n").split(" - ", 1)
+            fields = left.split()
+            rhs = right.split()
+            if unescape(fields[4]) == mountpoint:
+                return (
+                    fields[0], fields[2], unescape(fields[4]),
+                    rhs[0], unescape(rhs[1])
+                )
+    return None
+
+try:
+    before = record()
+    if before is None:
+        raise RuntimeError("mountpoint missing from mountinfo")
+
+    block = os.stat(source)
+    if not stat.S_ISBLK(block.st_mode):
+        raise RuntimeError("source is not a block device")
+
+    source_mm = (
+        str(os.major(block.st_rdev)) + ":" +
+        str(os.minor(block.st_rdev))
+    )
+    if before[1] != source_mm:
+        raise RuntimeError("mount device differs from source device")
+
+    fd = os.open(
+        mountpoint,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    )
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISDIR(opened.st_mode):
+            raise RuntimeError("mountpoint is not a directory")
+
+        opened_mm = (
+            str(os.major(opened.st_dev)) + ":" +
+            str(os.minor(opened.st_dev))
+        )
+        if opened_mm != source_mm:
+            raise RuntimeError("opened directory is not on source device")
+
+        if record() != before:
+            raise RuntimeError("mount changed during validation")
+
+        print(opened.st_dev)
+    finally:
+        os.close(fd)
+
+except Exception as exc:
+    print("USB_VALIDATE:", str(exc), file=sys.stderr)
+    raise SystemExit(1)
+PY_USB_VALIDATE
+) || {
+        USB_STATUS="USB_MOUNT_DEVICE_VALIDATION_FAILED"
+        return 1
+    }
+
+    [[ "$mount_dev" =~ ^[0-9]+$ ]] || {
+        USB_STATUS="USB_MOUNT_DEVICE_NUMBER_INVALID"
+        return 1
+    }
+
+    USB_FS_DEV="$mount_dev"
+
+    if [ ! -e "$CAPDIR" ] && [ ! -L "$CAPDIR" ]; then
+        if ! usb_fs_op "$USB_MOUNT" mkdir "BLE-CAPTURE"; then
+            if [ ! -d "$CAPDIR" ] || [ -L "$CAPDIR" ]; then
+                USB_STATUS="CAPDIR_CREATE_FAILED"
+                USB_FS_DEV=""
+                return 1
+            fi
+        fi
+    fi
+
+    [ -d "$CAPDIR" ] && [ ! -L "$CAPDIR" ] || {
+        USB_STATUS="CAPDIR_INVALID"
+        USB_FS_DEV=""
+        return 1
+    }
+
+    usb_fs_op "$CAPDIR" probe >/dev/null || {
+        USB_STATUS="CAPDIR_DEVICE_VALIDATION_FAILED"
+        USB_FS_DEV=""
+        return 1
+    }
+
+    now=$(date +%s) || {
+        USB_STATUS="USB_WRITE_CHECK_CLOCK_FAILED"
+        USB_FS_DEV=""
+        return 1
+    }
+
+    if [ $((now - LAST_USB_WRITE_CHECK)) -ge "$USB_WRITE_CHECK_INTERVAL" ]; then
+        testfile=".usb-write-test-$$-$BASHPID-$RANDOM"
+
+        usb_fs_op "$CAPDIR" create "$testfile" || {
+            USB_STATUS="USB_WRITE_FAILED"
+            USB_FS_DEV=""
+            return 1
+        }
+
+        usb_fs_op "$CAPDIR" unlink "$testfile" || {
+            USB_STATUS="USB_TESTFILE_REMOVE_FAILED"
+            USB_FS_DEV=""
+            return 1
+        }
+
+        LAST_USB_WRITE_CHECK="$now"
+    fi
+
+    USB_STATUS="OK"
+    return 0
+}
+
+validate_existing_mount() {
+    local source dev uuid opts rc
+
+    check_usb_mountpoint || return 1
+
+    mountpoint -q "$USB_MOUNT" || {
+        USB_STATUS="NOT_MOUNTED"
+        return 1
+    }
+
+    source=$(awk -v m="$USB_MOUNT" '$2==m {print $1; exit}' /proc/mounts)
+
+    [ -n "$source" ] || {
+        USB_STATUS="MOUNT_SOURCE_MISSING"
+        return 1
+    }
+
+    dev=$(readlink -f "$source" 2>/dev/null) || {
+        USB_STATUS="MOUNT_SOURCE_RESOLVE_FAILED"
+        return 1
+    }
+
+    validate_usb_device "$dev"
+    rc=$?
+    [ "$rc" -eq 0 ] || return "$rc"
+
+    uuid="$VALIDATED_UUID"
+
+    if [ -n "$USB_SOURCE" ] && [ "$dev" != "$USB_SOURCE" ]; then
+        USB_STATUS="MOUNT_SOURCE_CHANGED"
+        return 1
+    fi
+
+    if [ -n "$USB_UUID" ] && [ "$uuid" != "$USB_UUID" ]; then
+        USB_STATUS="MOUNT_UUID_CHANGED"
+        return 1
+    fi
+
+    opts=$(awk -v m="$USB_MOUNT" '$2==m {print $4; exit}' /proc/mounts)
+
+    case ",$opts," in
+        *,ro,*)
+            USB_STATUS="MOUNT_READ_ONLY"
+            return 1
+            ;;
+    esac
+
+    USB_SOURCE="$dev"
+    USB_UUID="$uuid"
+
+    if ! check_usb_writable; then
+        USB_SOURCE=""
+        USB_UUID=""
+        USB_FS_DEV=""
+        return 1
+    fi
+
+    return 0
+}
+
+check_mountpoint_free() {
+    local contents
+
+    check_usb_mountpoint || return 1
+
+    mountpoint -q "$USB_MOUNT" && {
+        USB_STATUS="ALREADY_MOUNTED"
+        return 1
+    }
+
+    contents=$(find "$USB_MOUNT" -mindepth 1 -maxdepth 1 -print 2>/dev/null) || {
+        USB_STATUS="MOUNTPOINT_SCAN_FAILED"
+        return 1
+    }
+
+    [ -z "$contents" ] || {
+        USB_STATUS="MOUNTPOINT_NOT_EMPTY"
+        return 1
+    }
+
+    return 0
+}
+
+discover_usb() {
+    local devices rc dev valid_count=0 valid_dev="" valid_uuid=""
+    local device_count=0
+
+    DISCOVERED_SOURCE=""
+    DISCOVERED_UUID=""
+
+    devices=$(blkid -c /dev/null -t "LABEL=$USB_LABEL" -o device 2>/dev/null)
+    rc=$?
+
+    if { [ "$rc" -eq 2 ] && [ -z "${devices//[[:space:]]/}" ]; } ||
+       { [ "$rc" -eq 0 ] && [ -z "${devices//[[:space:]]/}" ]; }; then
+        USB_STATUS="NO_DEVICE"
+        return 1
+    fi
+
+    if [ "$rc" -ne 0 ]; then
+        USB_STATUS="BLKID_DISCOVERY_FAILED"
+        return 2
+    fi
+
+    # Считаем все устройства с совпадающей меткой,
+    # а не только те, которые прошли последующую проверку.
+    while IFS= read -r dev; do
+        [ -n "$dev" ] || continue
+        device_count=$((device_count + 1))
+    done <<< "$devices"
+
+    if [ "$device_count" -gt 1 ]; then
+        USB_STATUS="AMBIGUOUS_DEVICES"
+        return 1
+    fi
+
+    [ "$device_count" -eq 1 ] || {
+        USB_STATUS="NO_DEVICE"
+        return 1
+    }
+
+    while IFS= read -r dev; do
+        [ -n "$dev" ] || continue
+
+        if validate_usb_device "$dev"; then
+            valid_count=$((valid_count + 1))
+            valid_dev="$dev"
+            valid_uuid="$VALIDATED_UUID"
+        else
+            rc=$?
+            if [ "$rc" -eq 2 ]; then
+                USB_STATUS="DEVICE_VALIDATION_INCOMPLETE"
+                return 2
+            fi
+
+            USB_STATUS="DEVICE_VALIDATION_FAILED"
+            return 1
+        fi
+    done <<< "$devices"
+
+    [ "$valid_count" -eq 1 ] || {
+        USB_STATUS="DEVICE_VALIDATION_FAILED"
+        return 1
+    }
+
+    DISCOVERED_SOURCE="$valid_dev"
+    DISCOVERED_UUID="$valid_uuid"
+    USB_STATUS="OK"
+    return 0
+}
+
+try_mount_usb() {
+    local dev rc
+
+    discover_usb || return $?
+
+    dev="$DISCOVERED_SOURCE"
+
+    check_mountpoint_free || return 1
+
+    mount "$dev" "$USB_MOUNT" 2>/dev/null || {
+        if mountpoint -q "$USB_MOUNT"; then
+            MOUNT_REJECTED=1
+            USB_STATUS="MOUNT_FAILED_BUT_MOUNTED"
+        else
+            USB_STATUS="MOUNT_FAILED"
+        fi
+        return 1
+    }
+
+    USB_SOURCE=""
+    USB_UUID=""
+
+    validate_existing_mount
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        MOUNT_REJECTED=1
+        return "$rc"
+    fi
+
+    if [ "$USB_SOURCE" != "$DISCOVERED_SOURCE" ]; then
+        MOUNT_REJECTED=1
+        USB_STATUS="MOUNTED_SOURCE_MISMATCH"
+        return 1
+    fi
+
+    if [ "$USB_UUID" != "$DISCOVERED_UUID" ]; then
+        MOUNT_REJECTED=1
+        USB_STATUS="MOUNTED_UUID_MISMATCH"
+        return 1
+    fi
+
+    MOUNT_REJECTED=0
+    return 0
+}
+
+check_usb() {
+    if mountpoint -q "$USB_MOUNT"; then
+        if [ "$MOUNT_REJECTED" -eq 1 ]; then
+            USB_STATUS="MOUNT_REJECTED_MANUAL_CHECK_REQUIRED"
+            return 1
+        fi
+
+        validate_existing_mount
+        return $?
+    fi
+
+    MOUNT_REJECTED=0
+    USB_SOURCE=""
+    USB_UUID=""
+
+    try_mount_usb
+}
+
+set_usb_not_ready() {
+    local was="$USB_READY" reason="$USB_STATUS"
+
+    USB_READY=0
+    USB_FS_DEV=""
+    USB_SOURCE=""
+    USB_UUID=""
+    LAST_USB_WRITE_CHECK=0
+
+    if [ "$was" -eq 1 ] || [ "$reason" != "$LAST_LOGGED_STATUS" ]; then
+        # После USB-ошибки не пишем событие на USB.
+        logger -t usb-log-collector -- "USB_NOT_READY status=$reason" 2>/dev/null || true
+        LAST_LOGGED_STATUS="$reason"
+    fi
+}
+
+set_usb_ready() {
+    local was="$USB_READY"
+
+    USB_READY=1
+    LAST_LOGGED_STATUS=""
+    TRANSIENT_ERRORS=0
+
+    [ "$was" -eq 1 ] || log_msg "USB_READY source=$USB_SOURCE uuid=$USB_UUID"
+}
+
+handle_stop() {
+    local rc=0
+
+    STOPPING=1
+
+    stop_btmon || rc=1
+    stop_reader || rc=1
+
+    if [ "$rc" -eq 0 ]; then
+        log_msg "COLLECTOR_STOPPED"
+    else
+        log_msg "COLLECTOR_STOP_INCOMPLETE: child remains or state ambiguous"
+    fi
+
+    return "$rc"
+}
+
+shutdown_collector() {
+    local original_rc=$? stop_rc=0
+
+    [ "$SHUTDOWN_DONE" -eq 0 ] || return
+    SHUTDOWN_DONE=1
+
+    trap - EXIT
+
+    handle_stop || stop_rc=1
+
+    if [ "$stop_rc" -eq 0 ]; then
+        release_main_lock || stop_rc=1
+    fi
+
+    if [ "$stop_rc" -eq 0 ] &&
+       [ "$LOCK_HELD" -eq 0 ] &&
+       [ "$LOCK_RECOVERY_BLOCKED" -eq 0 ]; then
+
+        if ! release_reap_lock; then
+            log_msg "SHUTDOWN_ERROR: reap lock release failed"
+            stop_rc=1
+        fi
+    else
+        log_msg "SHUTDOWN_LOCKS_RETAINED: manual inspection required"
+        stop_rc=1
+    fi
+
+    if [ "$original_rc" -ne 0 ] || [ "$stop_rc" -ne 0 ]; then
+        exit 1
+    fi
+
+    exit 0
+}
+
+main() {
+    local rc now stop_rc
+
+    acquire_main_lock || exit 1
+
+    find_existing_process reader
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+        log_msg "START_REFUSED: existing logread -f process found PID=$EXISTING_PROCESS"
+        exit 1
+    fi
+    [ "$rc" -eq 1 ] || exit 1
+
+    find_existing_process btmon
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+        log_msg "START_REFUSED: existing btmon -i hci0 process found PID=$EXISTING_PROCESS"
+        exit 1
+    fi
+    [ "$rc" -eq 1 ] || exit 1
+
+    log_msg "COLLECTOR_STARTED"
+
+    while [ "$STOPPING" -eq 0 ]; do
+        if [ "$PROCESS_BLOCKED" -eq 1 ]; then
+            USB_READY=0
+            USB_FS_DEV=""
+            USB_SOURCE=""
+            USB_UUID=""
+
+            # Stop only processes whose PID and starttime can be verified.
+            # Unknown or ambiguous processes must never be signalled.
+            stop_btmon || logger -t usb-log-collector -- \
+                "PROCESS_BLOCKED: btmon stop incomplete; manual inspection required" 2>/dev/null || true
+
+            stop_reader || logger -t usb-log-collector -- \
+                "PROCESS_BLOCKED: logread stop incomplete; manual inspection required" 2>/dev/null || true
+
+            sleep "$LOOP_SECONDS"
+            continue
+        fi
+
+        if check_usb; then
+            if [ "$USB_READY" -eq 0 ]; then
+                stop_rc=0
+
+                stop_btmon || stop_rc=1
+                stop_reader || stop_rc=1
+
+                if [ "$PROCESS_BLOCKED" -eq 1 ] || [ "$stop_rc" -ne 0 ]; then
+                    log_msg "USB_RECOVERY_BLOCKED: previous writer not safely stopped"
+                    sleep "$LOOP_SECONDS"
+                    continue
+                fi
+            fi
+
+            set_usb_ready
+
+            check_message_rotation || log_msg "MESSAGE_ROTATION_FAILED"
+
+            if [ "$PROCESS_BLOCKED" -eq 0 ]; then
+                check_reader_health
+            fi
+
+            if [ "$PROCESS_BLOCKED" -eq 0 ]; then
+                check_btmon_health
+            fi
+
+            if [ "$PROCESS_BLOCKED" -eq 0 ]; then
+                check_btmon_rotation
+            fi
+
+            if [ "$PROCESS_BLOCKED" -eq 0 ]; then
+                now=$(date +%s)
+
+                if [ $((now - LAST_CLEANUP)) -ge "$CLEANUP_INTERVAL" ]; then
+                    cleanup_old_ble || log_msg "BLE_CLEANUP_FAILED"
+                fi
+            fi
+        else
+            rc=$?
+            TRANSIENT_ERRORS=$((TRANSIENT_ERRORS + 1))
+
+            set_usb_not_ready
+
+            stop_btmon || logger -t usb-log-collector -- \
+                "USB_LOSS: btmon stop incomplete" 2>/dev/null || true
+
+            stop_reader || logger -t usb-log-collector -- \
+                "USB_LOSS: logread stop incomplete" 2>/dev/null || true
+        fi
+
+        sleep "$LOOP_SECONDS"
+    done
+}
+
+
+trap 'shutdown_collector' EXIT
+trap 'STOPPING=1' INT TERM QUIT
+
+main "$@"
