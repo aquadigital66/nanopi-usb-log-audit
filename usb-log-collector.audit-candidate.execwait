@@ -1110,7 +1110,7 @@ script_instance_exists() {
 
         cmd=$(proc_cmdline "$pid" 2>/dev/null) || continue
         # Match the collector script family, including audit candidates.
-        if printf '%s\n' "$cmd" | grep -Eq '^/data/usb-log/usb-log-collector([.]|$)'; then
+        # The script path may be argv[1] when launched as /bin/bash SCRIPT.\n        if printf '%s\n' "$cmd" | grep -Eq '(^|[[:space:]])/data/usb-log/usb-log-collector([.]|$)'; then
             start2=$(proc_starttime "$pid") || continue
             [ "$start" = "$start2" ] && return 0
         fi
