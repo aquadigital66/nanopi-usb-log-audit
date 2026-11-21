@@ -91,10 +91,10 @@ def unescape_mount(value):
     )
 
 def mount_record(dfd):
-    # Resolve the mount actually backing this open directory. Matching only
-    # the textual mountpoint is ambiguous when mounts are stacked.
+    # Resolve the mount actually backing this open directory. Textual
+    # mountpoint matching alone is ambiguous when mounts are stacked.
     try:
-        with open(f"/proc/self/fdinfo/{dfd}", "r") as stream:
+        with open("/proc/self/fdinfo/%d" % dfd, "r") as stream:
             mnt_id = next(
                 line.split(":", 1)[1].strip()
                 for line in stream
@@ -111,13 +111,9 @@ def mount_record(dfd):
             right_fields = right.split()
             if fields[0] == mnt_id:
                 matches.append((
-                    fields[0],
-                    fields[2],
-                    unescape_mount(fields[4]),
-                    right_fields[0],
-                    unescape_mount(right_fields[1]),
-                    fields[5],
-                    right_fields[2],
+                    fields[0], fields[2], unescape_mount(fields[4]),
+                    right_fields[0], unescape_mount(right_fields[1]),
+                    fields[5], right_fields[2],
                 ))
 
     if len(matches) != 1:
@@ -189,50 +185,6 @@ try:
             or os.path.basename(name) != name
         ):
             fail("invalid basename: " + repr(name))
-
-    def rename_noreplace(src, dst):
-        import ctypes
-        libc = ctypes.CDLL(None, use_errno=True)
-        fn = getattr(libc, "renameat2", None)
-        if fn is None:
-            raise OSError("renameat2 is unavailable")
-        fn.argtypes = [
-            ctypes.c_int, ctypes.c_char_p,
-            ctypes.c_int, ctypes.c_char_p,
-            ctypes.c_uint
-        ]
-        fn.restype = ctypes.c_int
-        rc = fn(dfd, os.fsencode(src), dfd, os.fsencode(dst), 1)
-        if rc != 0:
-            err = ctypes.get_errno()
-            raise OSError(err, os.strerror(err), src, dst)
-
-    def quarantine_file(name):
-        original = regular_file(name)
-        quarantine = ".usb-log-collector-quarantine-" + os.urandom(12).hex()
-        rename_noreplace(name, quarantine)
-        moved = regular_file(quarantine)
-        if (moved.st_dev, moved.st_ino) != (original.st_dev, original.st_ino):
-            try:
-                rename_noreplace(quarantine, name)
-            except OSError as exc:
-                fail("file identity changed; quarantined file retained as " +
-                     quarantine + ": " + str(exc))
-            fail("file identity changed during quarantine; original name restored")
-        return quarantine, original
-
-    def safe_unlink(name):
-        quarantine, original = quarantine_file(name)
-        # The name is now private to this operation under the collector's
-        # single-writer model; never unlink until the moved inode is verified.
-        moved = regular_file(quarantine)
-        if (moved.st_dev, moved.st_ino) != (original.st_dev, original.st_ino):
-            try:
-                rename_noreplace(quarantine, name)
-            except OSError:
-                fail("quarantined file changed; retained as " + quarantine)
-            fail("quarantined inode changed; original name restored")
-        os.unlink(quarantine)
 
     # Validate every caller-supplied filesystem name before dispatch.
     if action in (
@@ -331,25 +283,42 @@ try:
 
     elif action == "unlink":
         name = args[0]
-        if regular_file(name, missing_ok=True) is not None:
-            safe_unlink(name)
+        st = regular_file(name, missing_ok=True)
+        if st is not None:
+            os.unlink(name, dir_fd=dfd)
 
     elif action == "rename":
         src, dst = args
-        quarantine, original = quarantine_file(src)
-        try:
-            rename_noreplace(quarantine, dst)
-        except OSError as exc:
-            try:
-                rename_noreplace(quarantine, src)
-            except OSError as restore_exc:
-                fail("rename failed and source could not be restored; file retained as " +
-                     quarantine + ": " + str(restore_exc))
-            fail("renameat2(RENAME_NOREPLACE) failed: " + str(exc))
+        regular_file(src)
+        dst_st = regular_file(dst, missing_ok=True)
+        if dst_st is not None:
+            fail("rename destination already exists: " + dst)
+        # Atomic rename that refuses to replace an existing destination.
+        # No unsafe fallback if renameat2 is unavailable.
+        import ctypes
+        import errno
 
-        moved = regular_file(dst)
-        if (moved.st_dev, moved.st_ino) != (original.st_dev, original.st_ino):
-            fail("renamed destination inode differs from verified source")
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameat2 = getattr(libc, "renameat2", None)
+        if renameat2 is None:
+            fail("renameat2 is unavailable; refusing non-atomic rename")
+
+        renameat2.argtypes = [
+            ctypes.c_int, ctypes.c_char_p,
+            ctypes.c_int, ctypes.c_char_p,
+            ctypes.c_uint
+        ]
+        renameat2.restype = ctypes.c_int
+
+        rc = renameat2(
+            dfd, os.fsencode(src),
+            dfd, os.fsencode(dst),
+            1  # RENAME_NOREPLACE
+        )
+        if rc != 0:
+            err = ctypes.get_errno()
+            fail("renameat2(RENAME_NOREPLACE) failed: " +
+                 os.strerror(err))
 
     elif action == "ble-used":
         total = 0
@@ -374,7 +343,7 @@ try:
                 continue
             st = regular_file(name)
             if st.st_mtime < cutoff:
-                safe_unlink(name)
+                os.unlink(name, dir_fd=dfd)
 
     elif action == "mkdir":
         name = args[0]
@@ -431,10 +400,10 @@ def unescape_mount(value):
     )
 
 def mount_record(dfd):
-    # Resolve the mount actually backing this open directory. Matching only
-    # the textual mountpoint is ambiguous when mounts are stacked.
+    # Resolve the mount actually backing this open directory. Textual
+    # mountpoint matching alone is ambiguous when mounts are stacked.
     try:
-        with open(f"/proc/self/fdinfo/{dfd}", "r") as stream:
+        with open("/proc/self/fdinfo/%d" % dfd, "r") as stream:
             mnt_id = next(
                 line.split(":", 1)[1].strip()
                 for line in stream
@@ -451,13 +420,9 @@ def mount_record(dfd):
             right_fields = right.split()
             if fields[0] == mnt_id:
                 matches.append((
-                    fields[0],
-                    fields[2],
-                    unescape_mount(fields[4]),
-                    right_fields[0],
-                    unescape_mount(right_fields[1]),
-                    fields[5],
-                    right_fields[2],
+                    fields[0], fields[2], unescape_mount(fields[4]),
+                    right_fields[0], unescape_mount(right_fields[1]),
+                    fields[5], right_fields[2],
                 ))
 
     if len(matches) != 1:
@@ -529,50 +494,6 @@ try:
             or os.path.basename(name) != name
         ):
             fail("invalid basename: " + repr(name))
-
-    def rename_noreplace(src, dst):
-        import ctypes
-        libc = ctypes.CDLL(None, use_errno=True)
-        fn = getattr(libc, "renameat2", None)
-        if fn is None:
-            raise OSError("renameat2 is unavailable")
-        fn.argtypes = [
-            ctypes.c_int, ctypes.c_char_p,
-            ctypes.c_int, ctypes.c_char_p,
-            ctypes.c_uint
-        ]
-        fn.restype = ctypes.c_int
-        rc = fn(dfd, os.fsencode(src), dfd, os.fsencode(dst), 1)
-        if rc != 0:
-            err = ctypes.get_errno()
-            raise OSError(err, os.strerror(err), src, dst)
-
-    def quarantine_file(name):
-        original = regular_file(name)
-        quarantine = ".usb-log-collector-quarantine-" + os.urandom(12).hex()
-        rename_noreplace(name, quarantine)
-        moved = regular_file(quarantine)
-        if (moved.st_dev, moved.st_ino) != (original.st_dev, original.st_ino):
-            try:
-                rename_noreplace(quarantine, name)
-            except OSError as exc:
-                fail("file identity changed; quarantined file retained as " +
-                     quarantine + ": " + str(exc))
-            fail("file identity changed during quarantine; original name restored")
-        return quarantine, original
-
-    def safe_unlink(name):
-        quarantine, original = quarantine_file(name)
-        # The name is now private to this operation under the collector's
-        # single-writer model; never unlink until the moved inode is verified.
-        moved = regular_file(quarantine)
-        if (moved.st_dev, moved.st_ino) != (original.st_dev, original.st_ino):
-            try:
-                rename_noreplace(quarantine, name)
-            except OSError:
-                fail("quarantined file changed; retained as " + quarantine)
-            fail("quarantined inode changed; original name restored")
-        os.unlink(quarantine)
 
     # Validate every caller-supplied filesystem name before dispatch.
     if action in (
@@ -671,25 +592,42 @@ try:
 
     elif action == "unlink":
         name = args[0]
-        if regular_file(name, missing_ok=True) is not None:
-            safe_unlink(name)
+        st = regular_file(name, missing_ok=True)
+        if st is not None:
+            os.unlink(name, dir_fd=dfd)
 
     elif action == "rename":
         src, dst = args
-        quarantine, original = quarantine_file(src)
-        try:
-            rename_noreplace(quarantine, dst)
-        except OSError as exc:
-            try:
-                rename_noreplace(quarantine, src)
-            except OSError as restore_exc:
-                fail("rename failed and source could not be restored; file retained as " +
-                     quarantine + ": " + str(restore_exc))
-            fail("renameat2(RENAME_NOREPLACE) failed: " + str(exc))
+        regular_file(src)
+        dst_st = regular_file(dst, missing_ok=True)
+        if dst_st is not None:
+            fail("rename destination already exists: " + dst)
+        # Atomic rename that refuses to replace an existing destination.
+        # No unsafe fallback if renameat2 is unavailable.
+        import ctypes
+        import errno
 
-        moved = regular_file(dst)
-        if (moved.st_dev, moved.st_ino) != (original.st_dev, original.st_ino):
-            fail("renamed destination inode differs from verified source")
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameat2 = getattr(libc, "renameat2", None)
+        if renameat2 is None:
+            fail("renameat2 is unavailable; refusing non-atomic rename")
+
+        renameat2.argtypes = [
+            ctypes.c_int, ctypes.c_char_p,
+            ctypes.c_int, ctypes.c_char_p,
+            ctypes.c_uint
+        ]
+        renameat2.restype = ctypes.c_int
+
+        rc = renameat2(
+            dfd, os.fsencode(src),
+            dfd, os.fsencode(dst),
+            1  # RENAME_NOREPLACE
+        )
+        if rc != 0:
+            err = ctypes.get_errno()
+            fail("renameat2(RENAME_NOREPLACE) failed: " +
+                 os.strerror(err))
 
     elif action == "ble-used":
         total = 0
@@ -714,7 +652,7 @@ try:
                 continue
             st = regular_file(name)
             if st.st_mtime < cutoff:
-                safe_unlink(name)
+                os.unlink(name, dir_fd=dfd)
 
     elif action == "mkdir":
         name = args[0]
@@ -1097,8 +1035,7 @@ script_instance_exists() {
         [ "$state" = Z ] && continue
 
         cmd=$(proc_cmdline "$pid" 2>/dev/null) || continue
-        # Match the collector script family, including audit candidates and
-        # versioned copies, rather than maintaining a fragile filename list.
+        # Match the collector script family, including audit candidates.
         if printf '%s\n' "$cmd" | grep -Eq '^/data/usb-log/usb-log-collector([.]|$)'; then
             start2=$(proc_starttime "$pid") || continue
             [ "$start" = "$start2" ] && return 0
@@ -2365,7 +2302,7 @@ def unescape(value):
 
 fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
 try:
-    with open(f"/proc/self/fdinfo/{fd}", "r") as stream:
+    with open("/proc/self/fdinfo/%d" % fd, "r") as stream:
         mnt_id = next(line.split(":", 1)[1].strip()
                       for line in stream if line.startswith("mnt_id:"))
     found = []
@@ -2434,739 +2371,6 @@ PY_MOUNT_INFO
 
     return 0
 }
-
-check_mountpoint_free() {
-    local contents
-
-    check_usb_mountpoint || return 1
-
-    mountpoint -q "$USB_MOUNT" && {
-        USB_STATUS="ALREADY_MOUNTED"
-        return 1
-    }
-
-    contents=$(find "$USB_MOUNT" -mindepth 1 -maxdepth 1 -print 2>/dev/null) || {
-        USB_STATUS="MOUNTPOINT_SCAN_FAILED"
-        return 1
-    }
-
-    [ -z "$contents" ] || {
-        USB_STATUS="MOUNTPOINT_NOT_EMPTY"
-        return 1
-    }
-
-    return 0
-}
-
-discover_usb() {
-    local devices rc dev valid_count=0 valid_dev="" valid_uuid=""
-    local device_count=0
-
-    DISCOVERED_SOURCE=""
-    DISCOVERED_UUID=""
-
-    devices=$(blkid -c /dev/null -t "LABEL=$USB_LABEL" -o device 2>/dev/null)
-    rc=$?
-
-    if { [ "$rc" -eq 2 ] && [ -z "${devices//[[:space:]]/}" ]; } ||
-       { [ "$rc" -eq 0 ] && [ -z "${devices//[[:space:]]/}" ]; }; then
-        USB_STATUS="NO_DEVICE"
-        return 1
-    fi
-
-    if [ "$rc" -ne 0 ]; then
-        USB_STATUS="BLKID_DISCOVERY_FAILED"
-        return 2
-    fi
-
-    # Считаем все устройства с совпадающей меткой,
-    # а не только те, которые прошли последующую проверку.
-    while IFS= read -r dev; do
-        [ -n "$dev" ] || continue
-        device_count=$((device_count + 1))
-    done <<< "$devices"
-
-    if [ "$device_count" -gt 1 ]; then
-        USB_STATUS="AMBIGUOUS_DEVICES"
-        return 1
-    fi
-
-    [ "$device_count" -eq 1 ] || {
-        USB_STATUS="NO_DEVICE"
-        return 1
-    }
-
-    while IFS= read -r dev; do
-        [ -n "$dev" ] || continue
-
-        if validate_usb_device "$dev"; then
-            valid_count=$((valid_count + 1))
-            valid_dev="$dev"
-            valid_uuid="$VALIDATED_UUID"
-        else
-            rc=$?
-            if [ "$rc" -eq 2 ]; then
-                USB_STATUS="DEVICE_VALIDATION_INCOMPLETE"
-                return 2
-            fi
-
-            USB_STATUS="DEVICE_VALIDATION_FAILED"
-            return 1
-        fi
-    done <<< "$devices"
-
-    [ "$valid_count" -eq 1 ] || {
-        USB_STATUS="DEVICE_VALIDATION_FAILED"
-        return 1
-    }
-
-    DISCOVERED_SOURCE="$valid_dev"
-    DISCOVERED_UUID="$valid_uuid"
-    USB_STATUS="OK"
-    return 0
-}
-
-try_mount_usb() {
-    local dev rc
-
-    discover_usb || return $?
-
-    dev="$DISCOVERED_SOURCE"
-
-    check_mountpoint_free || return 1
-
-    mount "$dev" "$USB_MOUNT" 2>/dev/null || {
-        if mountpoint -q "$USB_MOUNT"; then
-            MOUNT_REJECTED=1
-            USB_STATUS="MOUNT_FAILED_BUT_MOUNTED"
-        else
-            USB_STATUS="MOUNT_FAILED"
-        fi
-        return 1
-    }
-
-    USB_SOURCE=""
-    USB_UUID=""
-
-    validate_existing_mount
-    rc=$?
-    if [ "$rc" -ne 0 ]; then
-        MOUNT_REJECTED=1
-        return "$rc"
-    fi
-
-    if [ "$USB_SOURCE" != "$DISCOVERED_SOURCE" ]; then
-        MOUNT_REJECTED=1
-        USB_STATUS="MOUNTED_SOURCE_MISMATCH"
-        return 1
-    fi
-
-    if [ "$USB_UUID" != "$DISCOVERED_UUID" ]; then
-        MOUNT_REJECTED=1
-        USB_STATUS="MOUNTED_UUID_MISMATCH"
-        return 1
-    fi
-
-    MOUNT_REJECTED=0
-    return 0
-}
-
-check_usb() {
-    if mountpoint -q "$USB_MOUNT"; then
-        if [ "$MOUNT_REJECTED" -eq 1 ]; then
-            USB_STATUS="MOUNT_REJECTED_MANUAL_CHECK_REQUIRED"
-            return 1
-        fi
-
-        validate_existing_mount
-        return $?
-    fi
-
-    MOUNT_REJECTED=0
-    USB_SOURCE=""
-    USB_UUID=""
-
-    try_mount_usb
-}
-
-set_usb_not_ready() {
-    local was="$USB_READY" reason="$USB_STATUS"
-
-    USB_READY=0
-    USB_FS_DEV=""
-    USB_SOURCE=""
-    USB_UUID=""
-    LAST_USB_WRITE_CHECK=0
-
-    if [ "$was" -eq 1 ] || [ "$reason" != "$LAST_LOGGED_STATUS" ]; then
-        # После USB-ошибки не пишем событие на USB.
-        logger -t usb-log-collector -- "USB_NOT_READY status=$reason" 2>/dev/null || true
-        LAST_LOGGED_STATUS="$reason"
-    fi
-}
-
-set_usb_ready() {
-    local was="$USB_READY"
-
-    USB_READY=1
-    LAST_LOGGED_STATUS=""
-    TRANSIENT_ERRORS=0
-
-    [ "$was" -eq 1 ] || log_msg "USB_READY source=$USB_SOURCE uuid=$USB_UUID"
-}
-
-handle_stop() {
-    local rc=0
-
-    STOPPING=1
-
-    stop_btmon || rc=1
-    stop_reader || rc=1
-
-    if [ "$rc" -eq 0 ]; then
-        log_msg "COLLECTOR_STOPPED"
-    else
-        log_msg "COLLECTOR_STOP_INCOMPLETE: child remains or state ambiguous"
-    fi
-
-    return "$rc"
-}
-
-shutdown_collector() {
-    local original_rc=$? stop_rc=0
-
-    [ "$SHUTDOWN_DONE" -eq 0 ] || return
-    SHUTDOWN_DONE=1
-
-    trap - EXIT
-
-    handle_stop || stop_rc=1
-
-    if [ "$stop_rc" -eq 0 ]; then
-        release_main_lock || stop_rc=1
-    fi
-
-    if [ "$stop_rc" -eq 0 ] &&
-       [ "$LOCK_HELD" -eq 0 ] &&
-       [ "$LOCK_RECOVERY_BLOCKED" -eq 0 ]; then
-
-        if ! release_reap_lock; then
-            log_msg "SHUTDOWN_ERROR: reap lock release failed"
-            stop_rc=1
-        fi
-    else
-        log_msg "SHUTDOWN_LOCKS_RETAINED: manual inspection required"
-        stop_rc=1
-    fi
-
-    if [ "$original_rc" -ne 0 ] || [ "$stop_rc" -ne 0 ]; then
-        exit 1
-    fi
-
-    exit 0
-}
-
-main() {
-    local rc now stop_rc
-
-    acquire_main_lock || exit 1
-
-    find_existing_process reader
-    rc=$?
-    if [ "$rc" -eq 0 ]; then
-        log_msg "START_REFUSED: existing logread -f process found PID=$EXISTING_PROCESS"
-        exit 1
-    fi
-    [ "$rc" -eq 1 ] || exit 1
-
-    find_existing_process btmon
-    rc=$?
-    if [ "$rc" -eq 0 ]; then
-        log_msg "START_REFUSED: existing btmon -i hci0 process found PID=$EXISTING_PROCESS"
-        exit 1
-    fi
-    [ "$rc" -eq 1 ] || exit 1
-
-    log_msg "COLLECTOR_STARTED"
-
-    while [ "$STOPPING" -eq 0 ]; do
-        if [ "$PROCESS_BLOCKED" -eq 1 ]; then
-            USB_READY=0
-            USB_FS_DEV=""
-            USB_SOURCE=""
-            USB_UUID=""
-
-            # Stop only processes whose PID and starttime can be verified.
-            # Unknown or ambiguous processes must never be signalled.
-            stop_btmon || logger -t usb-log-collector -- \
-                "PROCESS_BLOCKED: btmon stop incomplete; manual inspection required" 2>/dev/null || true
-
-            stop_reader || logger -t usb-log-collector -- \
-                "PROCESS_BLOCKED: logread stop incomplete; manual inspection required" 2>/dev/null || true
-
-            sleep "$LOOP_SECONDS"
-            continue
-        fi
-
-        if check_usb; then
-            if [ "$USB_READY" -eq 0 ]; then
-                stop_rc=0
-
-                stop_btmon || stop_rc=1
-                stop_reader || stop_rc=1
-
-                if [ "$PROCESS_BLOCKED" -eq 1 ] || [ "$stop_rc" -ne 0 ]; then
-                    log_msg "USB_RECOVERY_BLOCKED: previous writer not safely stopped"
-                    sleep "$LOOP_SECONDS"
-                    continue
-                fi
-            fi
-
-            set_usb_ready
-
-            check_message_rotation || log_msg "MESSAGE_ROTATION_FAILED"
-
-            if [ "$PROCESS_BLOCKED" -eq 0 ]; then
-                check_reader_health
-            fi
-
-            if [ "$PROCESS_BLOCKED" -eq 0 ]; then
-                check_btmon_health
-            fi
-
-            if [ "$PROCESS_BLOCKED" -eq 0 ]; then
-                check_btmon_rotation
-            fi
-
-            if [ "$PROCESS_BLOCKED" -eq 0 ]; then
-                now=$(date +%s)
-
-                if [ $((now - LAST_CLEANUP)) -ge "$CLEANUP_INTERVAL" ]; then
-                    cleanup_old_ble || log_msg "BLE_CLEANUP_FAILED"
-                fi
-            fi
-        else
-            rc=$?
-            TRANSIENT_ERRORS=$((TRANSIENT_ERRORS + 1))
-
-            set_usb_not_ready
-
-            stop_btmon || logger -t usb-log-collector -- \
-                "USB_LOSS: btmon stop incomplete" 2>/dev/null || true
-
-            stop_reader || logger -t usb-log-collector -- \
-                "USB_LOSS: logread stop incomplete" 2>/dev/null || true
-        fi
-
-        sleep "$LOOP_SECONDS"
-    done
-}
-
-
-trap 'shutdown_collector' EXIT
-trap 'STOPPING=1' INT TERM QUIT
-
-main "$@"
-\\t'*}"
-    opts="${info#*
-        *,ro,*)
-            USB_STATUS="MOUNT_READ_ONLY"
-            return 1
-            ;;
-    esac
-
-    USB_SOURCE="$dev"
-    USB_UUID="$uuid"
-
-    if ! check_usb_writable; then
-        USB_SOURCE=""
-        USB_UUID=""
-        USB_FS_DEV=""
-        return 1
-    fi
-
-    return 0
-}
-
-check_mountpoint_free() {
-    local contents
-
-    check_usb_mountpoint || return 1
-
-    mountpoint -q "$USB_MOUNT" && {
-        USB_STATUS="ALREADY_MOUNTED"
-        return 1
-    }
-
-    contents=$(find "$USB_MOUNT" -mindepth 1 -maxdepth 1 -print 2>/dev/null) || {
-        USB_STATUS="MOUNTPOINT_SCAN_FAILED"
-        return 1
-    }
-
-    [ -z "$contents" ] || {
-        USB_STATUS="MOUNTPOINT_NOT_EMPTY"
-        return 1
-    }
-
-    return 0
-}
-
-discover_usb() {
-    local devices rc dev valid_count=0 valid_dev="" valid_uuid=""
-    local device_count=0
-
-    DISCOVERED_SOURCE=""
-    DISCOVERED_UUID=""
-
-    devices=$(blkid -c /dev/null -t "LABEL=$USB_LABEL" -o device 2>/dev/null)
-    rc=$?
-
-    if { [ "$rc" -eq 2 ] && [ -z "${devices//[[:space:]]/}" ]; } ||
-       { [ "$rc" -eq 0 ] && [ -z "${devices//[[:space:]]/}" ]; }; then
-        USB_STATUS="NO_DEVICE"
-        return 1
-    fi
-
-    if [ "$rc" -ne 0 ]; then
-        USB_STATUS="BLKID_DISCOVERY_FAILED"
-        return 2
-    fi
-
-    # Считаем все устройства с совпадающей меткой,
-    # а не только те, которые прошли последующую проверку.
-    while IFS= read -r dev; do
-        [ -n "$dev" ] || continue
-        device_count=$((device_count + 1))
-    done <<< "$devices"
-
-    if [ "$device_count" -gt 1 ]; then
-        USB_STATUS="AMBIGUOUS_DEVICES"
-        return 1
-    fi
-
-    [ "$device_count" -eq 1 ] || {
-        USB_STATUS="NO_DEVICE"
-        return 1
-    }
-
-    while IFS= read -r dev; do
-        [ -n "$dev" ] || continue
-
-        if validate_usb_device "$dev"; then
-            valid_count=$((valid_count + 1))
-            valid_dev="$dev"
-            valid_uuid="$VALIDATED_UUID"
-        else
-            rc=$?
-            if [ "$rc" -eq 2 ]; then
-                USB_STATUS="DEVICE_VALIDATION_INCOMPLETE"
-                return 2
-            fi
-
-            USB_STATUS="DEVICE_VALIDATION_FAILED"
-            return 1
-        fi
-    done <<< "$devices"
-
-    [ "$valid_count" -eq 1 ] || {
-        USB_STATUS="DEVICE_VALIDATION_FAILED"
-        return 1
-    }
-
-    DISCOVERED_SOURCE="$valid_dev"
-    DISCOVERED_UUID="$valid_uuid"
-    USB_STATUS="OK"
-    return 0
-}
-
-try_mount_usb() {
-    local dev rc
-
-    discover_usb || return $?
-
-    dev="$DISCOVERED_SOURCE"
-
-    check_mountpoint_free || return 1
-
-    mount "$dev" "$USB_MOUNT" 2>/dev/null || {
-        if mountpoint -q "$USB_MOUNT"; then
-            MOUNT_REJECTED=1
-            USB_STATUS="MOUNT_FAILED_BUT_MOUNTED"
-        else
-            USB_STATUS="MOUNT_FAILED"
-        fi
-        return 1
-    }
-
-    USB_SOURCE=""
-    USB_UUID=""
-
-    validate_existing_mount
-    rc=$?
-    if [ "$rc" -ne 0 ]; then
-        MOUNT_REJECTED=1
-        return "$rc"
-    fi
-
-    if [ "$USB_SOURCE" != "$DISCOVERED_SOURCE" ]; then
-        MOUNT_REJECTED=1
-        USB_STATUS="MOUNTED_SOURCE_MISMATCH"
-        return 1
-    fi
-
-    if [ "$USB_UUID" != "$DISCOVERED_UUID" ]; then
-        MOUNT_REJECTED=1
-        USB_STATUS="MOUNTED_UUID_MISMATCH"
-        return 1
-    fi
-
-    MOUNT_REJECTED=0
-    return 0
-}
-
-check_usb() {
-    if mountpoint -q "$USB_MOUNT"; then
-        if [ "$MOUNT_REJECTED" -eq 1 ]; then
-            USB_STATUS="MOUNT_REJECTED_MANUAL_CHECK_REQUIRED"
-            return 1
-        fi
-
-        validate_existing_mount
-        return $?
-    fi
-
-    MOUNT_REJECTED=0
-    USB_SOURCE=""
-    USB_UUID=""
-
-    try_mount_usb
-}
-
-set_usb_not_ready() {
-    local was="$USB_READY" reason="$USB_STATUS"
-
-    USB_READY=0
-    USB_FS_DEV=""
-    USB_SOURCE=""
-    USB_UUID=""
-    LAST_USB_WRITE_CHECK=0
-
-    if [ "$was" -eq 1 ] || [ "$reason" != "$LAST_LOGGED_STATUS" ]; then
-        # После USB-ошибки не пишем событие на USB.
-        logger -t usb-log-collector -- "USB_NOT_READY status=$reason" 2>/dev/null || true
-        LAST_LOGGED_STATUS="$reason"
-    fi
-}
-
-set_usb_ready() {
-    local was="$USB_READY"
-
-    USB_READY=1
-    LAST_LOGGED_STATUS=""
-    TRANSIENT_ERRORS=0
-
-    [ "$was" -eq 1 ] || log_msg "USB_READY source=$USB_SOURCE uuid=$USB_UUID"
-}
-
-handle_stop() {
-    local rc=0
-
-    STOPPING=1
-
-    stop_btmon || rc=1
-    stop_reader || rc=1
-
-    if [ "$rc" -eq 0 ]; then
-        log_msg "COLLECTOR_STOPPED"
-    else
-        log_msg "COLLECTOR_STOP_INCOMPLETE: child remains or state ambiguous"
-    fi
-
-    return "$rc"
-}
-
-shutdown_collector() {
-    local original_rc=$? stop_rc=0
-
-    [ "$SHUTDOWN_DONE" -eq 0 ] || return
-    SHUTDOWN_DONE=1
-
-    trap - EXIT
-
-    handle_stop || stop_rc=1
-
-    if [ "$stop_rc" -eq 0 ]; then
-        release_main_lock || stop_rc=1
-    fi
-
-    if [ "$stop_rc" -eq 0 ] &&
-       [ "$LOCK_HELD" -eq 0 ] &&
-       [ "$LOCK_RECOVERY_BLOCKED" -eq 0 ]; then
-
-        if ! release_reap_lock; then
-            log_msg "SHUTDOWN_ERROR: reap lock release failed"
-            stop_rc=1
-        fi
-    else
-        log_msg "SHUTDOWN_LOCKS_RETAINED: manual inspection required"
-        stop_rc=1
-    fi
-
-    if [ "$original_rc" -ne 0 ] || [ "$stop_rc" -ne 0 ]; then
-        exit 1
-    fi
-
-    exit 0
-}
-
-main() {
-    local rc now stop_rc
-
-    acquire_main_lock || exit 1
-
-    find_existing_process reader
-    rc=$?
-    if [ "$rc" -eq 0 ]; then
-        log_msg "START_REFUSED: existing logread -f process found PID=$EXISTING_PROCESS"
-        exit 1
-    fi
-    [ "$rc" -eq 1 ] || exit 1
-
-    find_existing_process btmon
-    rc=$?
-    if [ "$rc" -eq 0 ]; then
-        log_msg "START_REFUSED: existing btmon -i hci0 process found PID=$EXISTING_PROCESS"
-        exit 1
-    fi
-    [ "$rc" -eq 1 ] || exit 1
-
-    log_msg "COLLECTOR_STARTED"
-
-    while [ "$STOPPING" -eq 0 ]; do
-        if [ "$PROCESS_BLOCKED" -eq 1 ]; then
-            USB_READY=0
-            USB_FS_DEV=""
-            USB_SOURCE=""
-            USB_UUID=""
-
-            # Stop only processes whose PID and starttime can be verified.
-            # Unknown or ambiguous processes must never be signalled.
-            stop_btmon || logger -t usb-log-collector -- \
-                "PROCESS_BLOCKED: btmon stop incomplete; manual inspection required" 2>/dev/null || true
-
-            stop_reader || logger -t usb-log-collector -- \
-                "PROCESS_BLOCKED: logread stop incomplete; manual inspection required" 2>/dev/null || true
-
-            sleep "$LOOP_SECONDS"
-            continue
-        fi
-
-        if check_usb; then
-            if [ "$USB_READY" -eq 0 ]; then
-                stop_rc=0
-
-                stop_btmon || stop_rc=1
-                stop_reader || stop_rc=1
-
-                if [ "$PROCESS_BLOCKED" -eq 1 ] || [ "$stop_rc" -ne 0 ]; then
-                    log_msg "USB_RECOVERY_BLOCKED: previous writer not safely stopped"
-                    sleep "$LOOP_SECONDS"
-                    continue
-                fi
-            fi
-
-            set_usb_ready
-
-            check_message_rotation || log_msg "MESSAGE_ROTATION_FAILED"
-
-            if [ "$PROCESS_BLOCKED" -eq 0 ]; then
-                check_reader_health
-            fi
-
-            if [ "$PROCESS_BLOCKED" -eq 0 ]; then
-                check_btmon_health
-            fi
-
-            if [ "$PROCESS_BLOCKED" -eq 0 ]; then
-                check_btmon_rotation
-            fi
-
-            if [ "$PROCESS_BLOCKED" -eq 0 ]; then
-                now=$(date +%s)
-
-                if [ $((now - LAST_CLEANUP)) -ge "$CLEANUP_INTERVAL" ]; then
-                    cleanup_old_ble || log_msg "BLE_CLEANUP_FAILED"
-                fi
-            fi
-        else
-            rc=$?
-            TRANSIENT_ERRORS=$((TRANSIENT_ERRORS + 1))
-
-            set_usb_not_ready
-
-            stop_btmon || logger -t usb-log-collector -- \
-                "USB_LOSS: btmon stop incomplete" 2>/dev/null || true
-
-            stop_reader || logger -t usb-log-collector -- \
-                "USB_LOSS: logread stop incomplete" 2>/dev/null || true
-        fi
-
-        sleep "$LOOP_SECONDS"
-    done
-}
-
-
-trap 'shutdown_collector' EXIT
-trap 'STOPPING=1' INT TERM QUIT
-
-main "$@"
-\\t'}"
-    [ -n "$source" ] || {
-        USB_STATUS="MOUNT_SOURCE_MISSING"
-        return 1
-    }
-
-    dev=$(readlink -f "$source" 2>/dev/null) || {
-        USB_STATUS="MOUNT_SOURCE_RESOLVE_FAILED"
-        return 1
-    }
-
-    validate_usb_device "$dev"
-    rc=$?
-    [ "$rc" -eq 0 ] || return "$rc"
-
-    uuid="$VALIDATED_UUID"
-
-    if [ -n "$USB_SOURCE" ] && [ "$dev" != "$USB_SOURCE" ]; then
-        USB_STATUS="MOUNT_SOURCE_CHANGED"
-        return 1
-    fi
-
-    if [ -n "$USB_UUID" ] && [ "$uuid" != "$USB_UUID" ]; then
-        USB_STATUS="MOUNT_UUID_CHANGED"
-        return 1
-    fi
-
-    case ",$opts," in
-        *,ro,*)
-            USB_STATUS="MOUNT_READ_ONLY"
-            return 1
-            ;;
-    esac
-
-    USB_SOURCE="$dev"
-    USB_UUID="$uuid"
-
-    if ! check_usb_writable; then
-        USB_SOURCE=""
-        USB_UUID=""
-        USB_FS_DEV=""
-        return 1
-    fi
-
-    return 0
-}
-
 check_mountpoint_free() {
     local contents
 
