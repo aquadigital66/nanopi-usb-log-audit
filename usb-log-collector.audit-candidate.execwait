@@ -90,21 +90,42 @@ def unescape_mount(value):
         value
     )
 
-def mount_record():
+def mount_record(dfd):
+    # Resolve the mount actually backing this open directory. Matching only
+    # the textual mountpoint is ambiguous when mounts are stacked.
+    try:
+        with open(f"/proc/self/fdinfo/{dfd}", "r") as stream:
+            mnt_id = next(
+                line.split(":", 1)[1].strip()
+                for line in stream
+                if line.startswith("mnt_id:")
+            )
+    except (OSError, StopIteration, IndexError):
+        fail("cannot determine mount ID for opened directory")
+
+    matches = []
     with open("/proc/self/mountinfo", "r") as stream:
         for line in stream:
-            left, right = line.rstrip("\n").split(" - ", 1)
+            left, right = line.rstrip("\\n").split(" - ", 1)
             fields = left.split()
             right_fields = right.split()
-            if unescape_mount(fields[4]) == mountpoint:
-                return (
+            if fields[0] == mnt_id:
+                matches.append((
                     fields[0],
                     fields[2],
                     unescape_mount(fields[4]),
                     right_fields[0],
                     unescape_mount(right_fields[1]),
-                )
-    return None
+                    fields[5],
+                    right_fields[2],
+                ))
+
+    if len(matches) != 1:
+        fail("opened directory mount ID is absent or ambiguous in mountinfo")
+    record = matches[0]
+    if record[2] != mountpoint:
+        fail("opened directory is not backed by the configured USB mountpoint")
+    return record
 
 def fail(message):
     print("usb_fs_op:", message, file=sys.stderr)
@@ -135,14 +156,14 @@ try:
         str(os.minor(dst.st_dev))
     )
 
-    record_before = mount_record()
+    record_before = mount_record(dfd)
     if record_before is None:
         fail("USB mountpoint is absent from mountinfo")
     if record_before[1] != source_mm:
         fail("mountinfo device differs from validated block device")
     if directory_mm != source_mm:
         fail("opened directory is not on the validated USB device")
-    if mount_record() != record_before:
+    if mount_record(dfd) != record_before:
         fail("mount changed during directory validation")
 
     def regular_file(name, missing_ok=False):
@@ -382,21 +403,42 @@ def unescape_mount(value):
         value
     )
 
-def mount_record():
+def mount_record(dfd):
+    # Resolve the mount actually backing this open directory. Matching only
+    # the textual mountpoint is ambiguous when mounts are stacked.
+    try:
+        with open(f"/proc/self/fdinfo/{dfd}", "r") as stream:
+            mnt_id = next(
+                line.split(":", 1)[1].strip()
+                for line in stream
+                if line.startswith("mnt_id:")
+            )
+    except (OSError, StopIteration, IndexError):
+        fail("cannot determine mount ID for opened directory")
+
+    matches = []
     with open("/proc/self/mountinfo", "r") as stream:
         for line in stream:
-            left, right = line.rstrip("\n").split(" - ", 1)
+            left, right = line.rstrip("\\n").split(" - ", 1)
             fields = left.split()
             right_fields = right.split()
-            if unescape_mount(fields[4]) == mountpoint:
-                return (
+            if fields[0] == mnt_id:
+                matches.append((
                     fields[0],
                     fields[2],
                     unescape_mount(fields[4]),
                     right_fields[0],
                     unescape_mount(right_fields[1]),
-                )
-    return None
+                    fields[5],
+                    right_fields[2],
+                ))
+
+    if len(matches) != 1:
+        fail("opened directory mount ID is absent or ambiguous in mountinfo")
+    record = matches[0]
+    if record[2] != mountpoint:
+        fail("opened directory is not backed by the configured USB mountpoint")
+    return record
 
 def fail(message):
     print("usb_fs_op:", message, file=sys.stderr)
@@ -427,14 +469,14 @@ try:
         str(os.minor(dst.st_dev))
     )
 
-    record_before = mount_record()
+    record_before = mount_record(dfd)
     if record_before is None:
         fail("USB mountpoint is absent from mountinfo")
     if record_before[1] != source_mm:
         fail("mountinfo device differs from validated block device")
     if directory_mm != source_mm:
         fail("opened directory is not on the validated USB device")
-    if mount_record() != record_before:
+    if mount_record(dfd) != record_before:
         fail("mount changed during directory validation")
 
     def regular_file(name, missing_ok=False):
@@ -1001,7 +1043,9 @@ script_instance_exists() {
         [ "$state" = Z ] && continue
 
         cmd=$(proc_cmdline "$pid" 2>/dev/null) || continue
-        if printf '%s\n' "$cmd" | grep -Fqx -e '/data/usb-log/usb-log-collector' -e '/data/usb-log/usb-log-collector.final'; then
+        # Match the collector script family, including audit candidates and
+        # versioned copies, rather than maintaining a fragile filename list.
+        if printf '%s\n' "$cmd" | grep -Eq '^/data/usb-log/usb-log-collector([.]|$)'; then
             start2=$(proc_starttime "$pid") || continue
             [ "$start" = "$start2" ] && return 0
         fi
@@ -2254,8 +2298,747 @@ validate_existing_mount() {
         return 1
     }
 
-    source=$(awk -v m="$USB_MOUNT" '$2==m {print $1; exit}' /proc/mounts)
+    info=$(python3 - "$USB_MOUNT" <<'PY_MOUNT_INFO'
+import os
+import re
+import sys
 
+path = sys.argv[1]
+def unescape(value):
+    return re.sub(r'\\\\([0-7]{3})',
+                  lambda m: chr(int(m.group(1), 8)), value)
+
+fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+try:
+    with open(f"/proc/self/fdinfo/{fd}", "r") as stream:
+        mnt_id = next(line.split(":", 1)[1].strip()
+                      for line in stream if line.startswith("mnt_id:"))
+    found = []
+    with open("/proc/self/mountinfo", "r") as stream:
+        for line in stream:
+            left, right = line.rstrip("\\n").split(" - ", 1)
+            fields = left.split()
+            rhs = right.split()
+            if fields[0] == mnt_id:
+                found.append((unescape(fields[4]), unescape(rhs[1]),
+                              fields[5], rhs[2]))
+    if len(found) != 1 or found[0][0] != path:
+        raise SystemExit("mount ID missing, ambiguous, or wrong mountpoint")
+    print(found[0][1] + "\\t" + found[0][2] + "," + found[0][3])
+finally:
+    os.close(fd)
+PY_MOUNT_INFO
+    ) || {
+        USB_STATUS="MOUNT_INFO_RESOLVE_FAILED"
+        return 1
+    }
+
+    source="${info%%
+        *,ro,*)
+            USB_STATUS="MOUNT_READ_ONLY"
+            return 1
+            ;;
+    esac
+
+    USB_SOURCE="$dev"
+    USB_UUID="$uuid"
+
+    if ! check_usb_writable; then
+        USB_SOURCE=""
+        USB_UUID=""
+        USB_FS_DEV=""
+        return 1
+    fi
+
+    return 0
+}
+
+check_mountpoint_free() {
+    local contents
+
+    check_usb_mountpoint || return 1
+
+    mountpoint -q "$USB_MOUNT" && {
+        USB_STATUS="ALREADY_MOUNTED"
+        return 1
+    }
+
+    contents=$(find "$USB_MOUNT" -mindepth 1 -maxdepth 1 -print 2>/dev/null) || {
+        USB_STATUS="MOUNTPOINT_SCAN_FAILED"
+        return 1
+    }
+
+    [ -z "$contents" ] || {
+        USB_STATUS="MOUNTPOINT_NOT_EMPTY"
+        return 1
+    }
+
+    return 0
+}
+
+discover_usb() {
+    local devices rc dev valid_count=0 valid_dev="" valid_uuid=""
+    local device_count=0
+
+    DISCOVERED_SOURCE=""
+    DISCOVERED_UUID=""
+
+    devices=$(blkid -c /dev/null -t "LABEL=$USB_LABEL" -o device 2>/dev/null)
+    rc=$?
+
+    if { [ "$rc" -eq 2 ] && [ -z "${devices//[[:space:]]/}" ]; } ||
+       { [ "$rc" -eq 0 ] && [ -z "${devices//[[:space:]]/}" ]; }; then
+        USB_STATUS="NO_DEVICE"
+        return 1
+    fi
+
+    if [ "$rc" -ne 0 ]; then
+        USB_STATUS="BLKID_DISCOVERY_FAILED"
+        return 2
+    fi
+
+    # Считаем все устройства с совпадающей меткой,
+    # а не только те, которые прошли последующую проверку.
+    while IFS= read -r dev; do
+        [ -n "$dev" ] || continue
+        device_count=$((device_count + 1))
+    done <<< "$devices"
+
+    if [ "$device_count" -gt 1 ]; then
+        USB_STATUS="AMBIGUOUS_DEVICES"
+        return 1
+    fi
+
+    [ "$device_count" -eq 1 ] || {
+        USB_STATUS="NO_DEVICE"
+        return 1
+    }
+
+    while IFS= read -r dev; do
+        [ -n "$dev" ] || continue
+
+        if validate_usb_device "$dev"; then
+            valid_count=$((valid_count + 1))
+            valid_dev="$dev"
+            valid_uuid="$VALIDATED_UUID"
+        else
+            rc=$?
+            if [ "$rc" -eq 2 ]; then
+                USB_STATUS="DEVICE_VALIDATION_INCOMPLETE"
+                return 2
+            fi
+
+            USB_STATUS="DEVICE_VALIDATION_FAILED"
+            return 1
+        fi
+    done <<< "$devices"
+
+    [ "$valid_count" -eq 1 ] || {
+        USB_STATUS="DEVICE_VALIDATION_FAILED"
+        return 1
+    }
+
+    DISCOVERED_SOURCE="$valid_dev"
+    DISCOVERED_UUID="$valid_uuid"
+    USB_STATUS="OK"
+    return 0
+}
+
+try_mount_usb() {
+    local dev rc
+
+    discover_usb || return $?
+
+    dev="$DISCOVERED_SOURCE"
+
+    check_mountpoint_free || return 1
+
+    mount "$dev" "$USB_MOUNT" 2>/dev/null || {
+        if mountpoint -q "$USB_MOUNT"; then
+            MOUNT_REJECTED=1
+            USB_STATUS="MOUNT_FAILED_BUT_MOUNTED"
+        else
+            USB_STATUS="MOUNT_FAILED"
+        fi
+        return 1
+    }
+
+    USB_SOURCE=""
+    USB_UUID=""
+
+    validate_existing_mount
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        MOUNT_REJECTED=1
+        return "$rc"
+    fi
+
+    if [ "$USB_SOURCE" != "$DISCOVERED_SOURCE" ]; then
+        MOUNT_REJECTED=1
+        USB_STATUS="MOUNTED_SOURCE_MISMATCH"
+        return 1
+    fi
+
+    if [ "$USB_UUID" != "$DISCOVERED_UUID" ]; then
+        MOUNT_REJECTED=1
+        USB_STATUS="MOUNTED_UUID_MISMATCH"
+        return 1
+    fi
+
+    MOUNT_REJECTED=0
+    return 0
+}
+
+check_usb() {
+    if mountpoint -q "$USB_MOUNT"; then
+        if [ "$MOUNT_REJECTED" -eq 1 ]; then
+            USB_STATUS="MOUNT_REJECTED_MANUAL_CHECK_REQUIRED"
+            return 1
+        fi
+
+        validate_existing_mount
+        return $?
+    fi
+
+    MOUNT_REJECTED=0
+    USB_SOURCE=""
+    USB_UUID=""
+
+    try_mount_usb
+}
+
+set_usb_not_ready() {
+    local was="$USB_READY" reason="$USB_STATUS"
+
+    USB_READY=0
+    USB_FS_DEV=""
+    USB_SOURCE=""
+    USB_UUID=""
+    LAST_USB_WRITE_CHECK=0
+
+    if [ "$was" -eq 1 ] || [ "$reason" != "$LAST_LOGGED_STATUS" ]; then
+        # После USB-ошибки не пишем событие на USB.
+        logger -t usb-log-collector -- "USB_NOT_READY status=$reason" 2>/dev/null || true
+        LAST_LOGGED_STATUS="$reason"
+    fi
+}
+
+set_usb_ready() {
+    local was="$USB_READY"
+
+    USB_READY=1
+    LAST_LOGGED_STATUS=""
+    TRANSIENT_ERRORS=0
+
+    [ "$was" -eq 1 ] || log_msg "USB_READY source=$USB_SOURCE uuid=$USB_UUID"
+}
+
+handle_stop() {
+    local rc=0
+
+    STOPPING=1
+
+    stop_btmon || rc=1
+    stop_reader || rc=1
+
+    if [ "$rc" -eq 0 ]; then
+        log_msg "COLLECTOR_STOPPED"
+    else
+        log_msg "COLLECTOR_STOP_INCOMPLETE: child remains or state ambiguous"
+    fi
+
+    return "$rc"
+}
+
+shutdown_collector() {
+    local original_rc=$? stop_rc=0
+
+    [ "$SHUTDOWN_DONE" -eq 0 ] || return
+    SHUTDOWN_DONE=1
+
+    trap - EXIT
+
+    handle_stop || stop_rc=1
+
+    if [ "$stop_rc" -eq 0 ]; then
+        release_main_lock || stop_rc=1
+    fi
+
+    if [ "$stop_rc" -eq 0 ] &&
+       [ "$LOCK_HELD" -eq 0 ] &&
+       [ "$LOCK_RECOVERY_BLOCKED" -eq 0 ]; then
+
+        if ! release_reap_lock; then
+            log_msg "SHUTDOWN_ERROR: reap lock release failed"
+            stop_rc=1
+        fi
+    else
+        log_msg "SHUTDOWN_LOCKS_RETAINED: manual inspection required"
+        stop_rc=1
+    fi
+
+    if [ "$original_rc" -ne 0 ] || [ "$stop_rc" -ne 0 ]; then
+        exit 1
+    fi
+
+    exit 0
+}
+
+main() {
+    local rc now stop_rc
+
+    acquire_main_lock || exit 1
+
+    find_existing_process reader
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+        log_msg "START_REFUSED: existing logread -f process found PID=$EXISTING_PROCESS"
+        exit 1
+    fi
+    [ "$rc" -eq 1 ] || exit 1
+
+    find_existing_process btmon
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+        log_msg "START_REFUSED: existing btmon -i hci0 process found PID=$EXISTING_PROCESS"
+        exit 1
+    fi
+    [ "$rc" -eq 1 ] || exit 1
+
+    log_msg "COLLECTOR_STARTED"
+
+    while [ "$STOPPING" -eq 0 ]; do
+        if [ "$PROCESS_BLOCKED" -eq 1 ]; then
+            USB_READY=0
+            USB_FS_DEV=""
+            USB_SOURCE=""
+            USB_UUID=""
+
+            # Stop only processes whose PID and starttime can be verified.
+            # Unknown or ambiguous processes must never be signalled.
+            stop_btmon || logger -t usb-log-collector -- \
+                "PROCESS_BLOCKED: btmon stop incomplete; manual inspection required" 2>/dev/null || true
+
+            stop_reader || logger -t usb-log-collector -- \
+                "PROCESS_BLOCKED: logread stop incomplete; manual inspection required" 2>/dev/null || true
+
+            sleep "$LOOP_SECONDS"
+            continue
+        fi
+
+        if check_usb; then
+            if [ "$USB_READY" -eq 0 ]; then
+                stop_rc=0
+
+                stop_btmon || stop_rc=1
+                stop_reader || stop_rc=1
+
+                if [ "$PROCESS_BLOCKED" -eq 1 ] || [ "$stop_rc" -ne 0 ]; then
+                    log_msg "USB_RECOVERY_BLOCKED: previous writer not safely stopped"
+                    sleep "$LOOP_SECONDS"
+                    continue
+                fi
+            fi
+
+            set_usb_ready
+
+            check_message_rotation || log_msg "MESSAGE_ROTATION_FAILED"
+
+            if [ "$PROCESS_BLOCKED" -eq 0 ]; then
+                check_reader_health
+            fi
+
+            if [ "$PROCESS_BLOCKED" -eq 0 ]; then
+                check_btmon_health
+            fi
+
+            if [ "$PROCESS_BLOCKED" -eq 0 ]; then
+                check_btmon_rotation
+            fi
+
+            if [ "$PROCESS_BLOCKED" -eq 0 ]; then
+                now=$(date +%s)
+
+                if [ $((now - LAST_CLEANUP)) -ge "$CLEANUP_INTERVAL" ]; then
+                    cleanup_old_ble || log_msg "BLE_CLEANUP_FAILED"
+                fi
+            fi
+        else
+            rc=$?
+            TRANSIENT_ERRORS=$((TRANSIENT_ERRORS + 1))
+
+            set_usb_not_ready
+
+            stop_btmon || logger -t usb-log-collector -- \
+                "USB_LOSS: btmon stop incomplete" 2>/dev/null || true
+
+            stop_reader || logger -t usb-log-collector -- \
+                "USB_LOSS: logread stop incomplete" 2>/dev/null || true
+        fi
+
+        sleep "$LOOP_SECONDS"
+    done
+}
+
+
+trap 'shutdown_collector' EXIT
+trap 'STOPPING=1' INT TERM QUIT
+
+main "$@"
+\\t'*}"
+    opts="${info#*
+        *,ro,*)
+            USB_STATUS="MOUNT_READ_ONLY"
+            return 1
+            ;;
+    esac
+
+    USB_SOURCE="$dev"
+    USB_UUID="$uuid"
+
+    if ! check_usb_writable; then
+        USB_SOURCE=""
+        USB_UUID=""
+        USB_FS_DEV=""
+        return 1
+    fi
+
+    return 0
+}
+
+check_mountpoint_free() {
+    local contents
+
+    check_usb_mountpoint || return 1
+
+    mountpoint -q "$USB_MOUNT" && {
+        USB_STATUS="ALREADY_MOUNTED"
+        return 1
+    }
+
+    contents=$(find "$USB_MOUNT" -mindepth 1 -maxdepth 1 -print 2>/dev/null) || {
+        USB_STATUS="MOUNTPOINT_SCAN_FAILED"
+        return 1
+    }
+
+    [ -z "$contents" ] || {
+        USB_STATUS="MOUNTPOINT_NOT_EMPTY"
+        return 1
+    }
+
+    return 0
+}
+
+discover_usb() {
+    local devices rc dev valid_count=0 valid_dev="" valid_uuid=""
+    local device_count=0
+
+    DISCOVERED_SOURCE=""
+    DISCOVERED_UUID=""
+
+    devices=$(blkid -c /dev/null -t "LABEL=$USB_LABEL" -o device 2>/dev/null)
+    rc=$?
+
+    if { [ "$rc" -eq 2 ] && [ -z "${devices//[[:space:]]/}" ]; } ||
+       { [ "$rc" -eq 0 ] && [ -z "${devices//[[:space:]]/}" ]; }; then
+        USB_STATUS="NO_DEVICE"
+        return 1
+    fi
+
+    if [ "$rc" -ne 0 ]; then
+        USB_STATUS="BLKID_DISCOVERY_FAILED"
+        return 2
+    fi
+
+    # Считаем все устройства с совпадающей меткой,
+    # а не только те, которые прошли последующую проверку.
+    while IFS= read -r dev; do
+        [ -n "$dev" ] || continue
+        device_count=$((device_count + 1))
+    done <<< "$devices"
+
+    if [ "$device_count" -gt 1 ]; then
+        USB_STATUS="AMBIGUOUS_DEVICES"
+        return 1
+    fi
+
+    [ "$device_count" -eq 1 ] || {
+        USB_STATUS="NO_DEVICE"
+        return 1
+    }
+
+    while IFS= read -r dev; do
+        [ -n "$dev" ] || continue
+
+        if validate_usb_device "$dev"; then
+            valid_count=$((valid_count + 1))
+            valid_dev="$dev"
+            valid_uuid="$VALIDATED_UUID"
+        else
+            rc=$?
+            if [ "$rc" -eq 2 ]; then
+                USB_STATUS="DEVICE_VALIDATION_INCOMPLETE"
+                return 2
+            fi
+
+            USB_STATUS="DEVICE_VALIDATION_FAILED"
+            return 1
+        fi
+    done <<< "$devices"
+
+    [ "$valid_count" -eq 1 ] || {
+        USB_STATUS="DEVICE_VALIDATION_FAILED"
+        return 1
+    }
+
+    DISCOVERED_SOURCE="$valid_dev"
+    DISCOVERED_UUID="$valid_uuid"
+    USB_STATUS="OK"
+    return 0
+}
+
+try_mount_usb() {
+    local dev rc
+
+    discover_usb || return $?
+
+    dev="$DISCOVERED_SOURCE"
+
+    check_mountpoint_free || return 1
+
+    mount "$dev" "$USB_MOUNT" 2>/dev/null || {
+        if mountpoint -q "$USB_MOUNT"; then
+            MOUNT_REJECTED=1
+            USB_STATUS="MOUNT_FAILED_BUT_MOUNTED"
+        else
+            USB_STATUS="MOUNT_FAILED"
+        fi
+        return 1
+    }
+
+    USB_SOURCE=""
+    USB_UUID=""
+
+    validate_existing_mount
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        MOUNT_REJECTED=1
+        return "$rc"
+    fi
+
+    if [ "$USB_SOURCE" != "$DISCOVERED_SOURCE" ]; then
+        MOUNT_REJECTED=1
+        USB_STATUS="MOUNTED_SOURCE_MISMATCH"
+        return 1
+    fi
+
+    if [ "$USB_UUID" != "$DISCOVERED_UUID" ]; then
+        MOUNT_REJECTED=1
+        USB_STATUS="MOUNTED_UUID_MISMATCH"
+        return 1
+    fi
+
+    MOUNT_REJECTED=0
+    return 0
+}
+
+check_usb() {
+    if mountpoint -q "$USB_MOUNT"; then
+        if [ "$MOUNT_REJECTED" -eq 1 ]; then
+            USB_STATUS="MOUNT_REJECTED_MANUAL_CHECK_REQUIRED"
+            return 1
+        fi
+
+        validate_existing_mount
+        return $?
+    fi
+
+    MOUNT_REJECTED=0
+    USB_SOURCE=""
+    USB_UUID=""
+
+    try_mount_usb
+}
+
+set_usb_not_ready() {
+    local was="$USB_READY" reason="$USB_STATUS"
+
+    USB_READY=0
+    USB_FS_DEV=""
+    USB_SOURCE=""
+    USB_UUID=""
+    LAST_USB_WRITE_CHECK=0
+
+    if [ "$was" -eq 1 ] || [ "$reason" != "$LAST_LOGGED_STATUS" ]; then
+        # После USB-ошибки не пишем событие на USB.
+        logger -t usb-log-collector -- "USB_NOT_READY status=$reason" 2>/dev/null || true
+        LAST_LOGGED_STATUS="$reason"
+    fi
+}
+
+set_usb_ready() {
+    local was="$USB_READY"
+
+    USB_READY=1
+    LAST_LOGGED_STATUS=""
+    TRANSIENT_ERRORS=0
+
+    [ "$was" -eq 1 ] || log_msg "USB_READY source=$USB_SOURCE uuid=$USB_UUID"
+}
+
+handle_stop() {
+    local rc=0
+
+    STOPPING=1
+
+    stop_btmon || rc=1
+    stop_reader || rc=1
+
+    if [ "$rc" -eq 0 ]; then
+        log_msg "COLLECTOR_STOPPED"
+    else
+        log_msg "COLLECTOR_STOP_INCOMPLETE: child remains or state ambiguous"
+    fi
+
+    return "$rc"
+}
+
+shutdown_collector() {
+    local original_rc=$? stop_rc=0
+
+    [ "$SHUTDOWN_DONE" -eq 0 ] || return
+    SHUTDOWN_DONE=1
+
+    trap - EXIT
+
+    handle_stop || stop_rc=1
+
+    if [ "$stop_rc" -eq 0 ]; then
+        release_main_lock || stop_rc=1
+    fi
+
+    if [ "$stop_rc" -eq 0 ] &&
+       [ "$LOCK_HELD" -eq 0 ] &&
+       [ "$LOCK_RECOVERY_BLOCKED" -eq 0 ]; then
+
+        if ! release_reap_lock; then
+            log_msg "SHUTDOWN_ERROR: reap lock release failed"
+            stop_rc=1
+        fi
+    else
+        log_msg "SHUTDOWN_LOCKS_RETAINED: manual inspection required"
+        stop_rc=1
+    fi
+
+    if [ "$original_rc" -ne 0 ] || [ "$stop_rc" -ne 0 ]; then
+        exit 1
+    fi
+
+    exit 0
+}
+
+main() {
+    local rc now stop_rc
+
+    acquire_main_lock || exit 1
+
+    find_existing_process reader
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+        log_msg "START_REFUSED: existing logread -f process found PID=$EXISTING_PROCESS"
+        exit 1
+    fi
+    [ "$rc" -eq 1 ] || exit 1
+
+    find_existing_process btmon
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+        log_msg "START_REFUSED: existing btmon -i hci0 process found PID=$EXISTING_PROCESS"
+        exit 1
+    fi
+    [ "$rc" -eq 1 ] || exit 1
+
+    log_msg "COLLECTOR_STARTED"
+
+    while [ "$STOPPING" -eq 0 ]; do
+        if [ "$PROCESS_BLOCKED" -eq 1 ]; then
+            USB_READY=0
+            USB_FS_DEV=""
+            USB_SOURCE=""
+            USB_UUID=""
+
+            # Stop only processes whose PID and starttime can be verified.
+            # Unknown or ambiguous processes must never be signalled.
+            stop_btmon || logger -t usb-log-collector -- \
+                "PROCESS_BLOCKED: btmon stop incomplete; manual inspection required" 2>/dev/null || true
+
+            stop_reader || logger -t usb-log-collector -- \
+                "PROCESS_BLOCKED: logread stop incomplete; manual inspection required" 2>/dev/null || true
+
+            sleep "$LOOP_SECONDS"
+            continue
+        fi
+
+        if check_usb; then
+            if [ "$USB_READY" -eq 0 ]; then
+                stop_rc=0
+
+                stop_btmon || stop_rc=1
+                stop_reader || stop_rc=1
+
+                if [ "$PROCESS_BLOCKED" -eq 1 ] || [ "$stop_rc" -ne 0 ]; then
+                    log_msg "USB_RECOVERY_BLOCKED: previous writer not safely stopped"
+                    sleep "$LOOP_SECONDS"
+                    continue
+                fi
+            fi
+
+            set_usb_ready
+
+            check_message_rotation || log_msg "MESSAGE_ROTATION_FAILED"
+
+            if [ "$PROCESS_BLOCKED" -eq 0 ]; then
+                check_reader_health
+            fi
+
+            if [ "$PROCESS_BLOCKED" -eq 0 ]; then
+                check_btmon_health
+            fi
+
+            if [ "$PROCESS_BLOCKED" -eq 0 ]; then
+                check_btmon_rotation
+            fi
+
+            if [ "$PROCESS_BLOCKED" -eq 0 ]; then
+                now=$(date +%s)
+
+                if [ $((now - LAST_CLEANUP)) -ge "$CLEANUP_INTERVAL" ]; then
+                    cleanup_old_ble || log_msg "BLE_CLEANUP_FAILED"
+                fi
+            fi
+        else
+            rc=$?
+            TRANSIENT_ERRORS=$((TRANSIENT_ERRORS + 1))
+
+            set_usb_not_ready
+
+            stop_btmon || logger -t usb-log-collector -- \
+                "USB_LOSS: btmon stop incomplete" 2>/dev/null || true
+
+            stop_reader || logger -t usb-log-collector -- \
+                "USB_LOSS: logread stop incomplete" 2>/dev/null || true
+        fi
+
+        sleep "$LOOP_SECONDS"
+    done
+}
+
+
+trap 'shutdown_collector' EXIT
+trap 'STOPPING=1' INT TERM QUIT
+
+main "$@"
+\\t'}"
     [ -n "$source" ] || {
         USB_STATUS="MOUNT_SOURCE_MISSING"
         return 1
@@ -2281,8 +3064,6 @@ validate_existing_mount() {
         USB_STATUS="MOUNT_UUID_CHANGED"
         return 1
     fi
-
-    opts=$(awk -v m="$USB_MOUNT" '$2==m {print $4; exit}' /proc/mounts)
 
     case ",$opts," in
         *,ro,*)
